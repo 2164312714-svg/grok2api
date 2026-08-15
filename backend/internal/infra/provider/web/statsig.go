@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +43,10 @@ type statsigSignResult struct {
 type statsigWarmTarget struct {
 	method string
 	target string
+}
+
+type statsigMetaRequestClient interface {
+	Do(*http.Request) (*http.Response, error)
 }
 
 type statsigSigner struct {
@@ -119,9 +124,13 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 	if len(pending) == 0 {
 		return 0, nil
 	}
-	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
-	if err != nil {
-		return 0, err
+	meta := ""
+	if statsigSignerNeedsMeta(signerURL) {
+		var err error
+		meta, err = s.fetchMeta(ctx, baseURL, token, lease)
+		if err != nil {
+			return 0, err
+		}
 	}
 	warmed := 0
 	for _, target := range pending {
@@ -136,6 +145,9 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 }
 
 func (s *statsigSigner) freshSignature(ctx context.Context, baseURL, signerURL, token string, lease *infraegress.Lease, method, path string) (string, error) {
+	if !statsigSignerNeedsMeta(signerURL) {
+		return s.requestSignature(ctx, signerURL, method, path, "")
+	}
 	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
 	if err != nil {
 		return "", err
@@ -154,6 +166,11 @@ func (s *statsigSigner) freshSignature(ctx context.Context, baseURL, signerURL, 
 		return "", fmt.Errorf("Statsig 签名失败: %w", retryErr)
 	}
 	return signature, nil
+}
+
+func statsigSignerNeedsMeta(endpoint string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	return err != nil || !signerurl.IsInternalHost(parsed.Hostname())
 }
 
 func (s *statsigSigner) Invalidate(baseURL, signerURL, method, target string) {
@@ -272,43 +289,64 @@ func fetchStatsigMetaContent(ctx context.Context, baseURL, token string, lease *
 	if lease == nil {
 		return "", fmt.Errorf("Statsig 获取缺少出口租约")
 	}
+	return fetchStatsigMetaContentWithClient(ctx, baseURL, token, lease.UserAgent, lease.CFCookies, lease)
+}
+
+func fetchStatsigMetaContentWithClient(ctx context.Context, baseURL, token, userAgent, cloudflareCookies string, client statsigMetaRequestClient) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("Statsig 获取缺少出口客户端")
+	}
 	requestCtx, cancel := context.WithTimeout(infraegress.WithPhysicalCallStage(ctx, "statsig_meta"), 15*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/index", nil)
-	if err != nil {
-		return "", err
+	baseURL = strings.TrimRight(baseURL, "/")
+	var attempts []error
+	for _, pagePath := range []string{"/imagine", "/"} {
+		request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, baseURL+pagePath, nil)
+		if err != nil {
+			return "", err
+		}
+		request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+		request.Header.Set("Cache-Control", "no-cache")
+		request.Header.Set("Pragma", "no-cache")
+		request.Header.Set("Sec-Fetch-Dest", "document")
+		request.Header.Set("Sec-Fetch-Mode", "navigate")
+		request.Header.Set("Sec-Fetch-Site", "none")
+		request.Header.Set("Sec-Fetch-User", "?1")
+		request.Header.Set("Upgrade-Insecure-Requests", "1")
+		request.Header.Set("User-Agent", userAgent)
+		request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, cloudflareCookies))
+		response, err := client.Do(request)
+		if err != nil {
+			attempts = append(attempts, fmt.Errorf("Grok Statsig 页面 %s: %w", pagePath, err))
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, statsigMetaBodyLimit+1))
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			attempts = append(attempts, fmt.Errorf("读取 Grok Statsig 页面 %s: %w", pagePath, readErr))
+			continue
+		}
+		if closeErr != nil {
+			attempts = append(attempts, fmt.Errorf("关闭 Grok Statsig 页面 %s: %w", pagePath, closeErr))
+			continue
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			attempts = append(attempts, fmt.Errorf("Grok Statsig 页面 %s 返回 %d", pagePath, response.StatusCode))
+			continue
+		}
+		if len(body) > statsigMetaBodyLimit {
+			attempts = append(attempts, fmt.Errorf("Grok Statsig 页面 %s 超过安全上限", pagePath))
+			continue
+		}
+		content, extractErr := extractStatsigMetaContent(body)
+		if extractErr != nil {
+			attempts = append(attempts, fmt.Errorf("解析 Grok Statsig 页面 %s: %w", pagePath, extractErr))
+			continue
+		}
+		return content, nil
 	}
-	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	request.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	request.Header.Set("Cache-Control", "no-cache")
-	request.Header.Set("Pragma", "no-cache")
-	request.Header.Set("Sec-Fetch-Dest", "document")
-	request.Header.Set("Sec-Fetch-Mode", "navigate")
-	request.Header.Set("Sec-Fetch-Site", "same-origin")
-	request.Header.Set("Upgrade-Insecure-Requests", "1")
-	request.Header.Set("User-Agent", lease.UserAgent)
-	request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, lease.CFCookies))
-	response, err := lease.Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("Grok index 返回 %d", response.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, statsigMetaBodyLimit+1))
-	if err != nil {
-		return "", err
-	}
-	if len(body) > statsigMetaBodyLimit {
-		return "", fmt.Errorf("Grok index 超过安全上限")
-	}
-	content, err := extractStatsigMetaContent(body)
-	if err != nil {
-		return "", err
-	}
-	return content, nil
+	return "", errors.Join(attempts...)
 }
 
 func extractStatsigMetaContent(body []byte) (string, error) {
@@ -317,7 +355,7 @@ func extractStatsigMetaContent(body []byte) (string, error) {
 		switch tokenizer.Next() {
 		case html.ErrorToken:
 			if tokenizer.Err() == io.EOF {
-				return "", fmt.Errorf("Grok index 缺少 grok-site-verification")
+				return "", fmt.Errorf("缺少 grok-site-verification")
 			}
 			return "", tokenizer.Err()
 		case html.StartTagToken, html.SelfClosingTagToken:

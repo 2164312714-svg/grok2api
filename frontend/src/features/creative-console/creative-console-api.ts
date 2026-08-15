@@ -320,7 +320,7 @@ function resolveMediaURL(value: string): string {
   try {
     const browserOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
     const resolved = new URL(url, `${browserOrigin}/`);
-    if (resolved.pathname.startsWith("/v1/media/images/")) {
+    if (resolved.pathname.startsWith("/v1/media/images/") || /^\/v1\/videos\/[^/]+\/content$/.test(resolved.pathname)) {
       return `${resolved.pathname}${resolved.search}${resolved.hash}`;
     }
     return resolved.origin === browserOrigin ? `${resolved.pathname}${resolved.search}${resolved.hash}` : resolved.toString();

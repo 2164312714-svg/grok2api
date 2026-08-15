@@ -115,6 +115,84 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	}
 }
 
+func TestVideoGenerationAcceptsChatMessagesAsPrompt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
+
+	for _, body := range []string{
+		`{"model":"grok-imagine-video","messages":[{"role":"user","content":"animate ocean waves"}]}`,
+		`{"model":"grok-imagine-video","messages":[{"role":"user","content":[{"type":"text","text":"animate"},{"type":"input_text","text":"ocean waves"}]}]}`,
+		`{"model":"grok-imagine-video","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"reply"},{"role":"user","content":"final prompt"}]}`,
+		`{"model":"grok-imagine-video","messages":[{"role":"user","content":"animate ocean waves"}],"stream":true}`,
+		`{"model":"grok-imagine-video","messages":[{"role":"user","content":"animate ocean waves"}],"stream":true,"temperature":0.7,"top_p":0.9,"max_tokens":256,"presence_penalty":0,"frequency_penalty":0,"stop":["DONE"],"seed":42,"logprobs":false,"top_logprobs":2,"tools":[],"tool_choice":"none","parallel_tool_calls":false,"response_format":{"type":"text"},"reasoning_effort":"medium"}`,
+		`{"model":"grok-imagine-video","prompt":"explicit","messages":{"not":"an array"}}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+
+	for _, test := range []struct {
+		body string
+		want string
+	}{
+		{body: `{"model":"grok-imagine-video","messages":{"role":"user","content":"test"}}`, want: "messages 无效"},
+		{body: `{"model":"grok-imagine-video","messages":[{"role":"assistant","content":"reply"}]}`, want: "必须提供 prompt"},
+		{body: `{"model":"grok-imagine-video","messages":[{"role":"user","content":"test"}],"stream":"true"}`, want: "cannot unmarshal string"},
+		{body: `{"model":"grok-imagine-video","messages":[{"role":"user","content":"test"}],"unexpected":true}`, want: "unknown field"},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(test.body))
+		request.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.want) {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestExtractVideoPromptFromMessagesUsesOnlyLastUserText(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"role":"user","content":"old prompt"},
+		{"role":"assistant","content":"assistant history"},
+		{"role":"user","content":[
+			{"type":"input_text","text":"new prompt"},
+			{"type":"image_url","image_url":{"url":"https://example.com/input.png"}},
+			{"type":"text","text":"second line"}
+		]}
+	]`)
+	prompt, err := extractVideoPromptFromMessages(raw)
+	if err != nil || prompt != "new prompt\nsecond line" {
+		t.Fatalf("prompt=%q err=%v", prompt, err)
+	}
+}
+
+func TestMergeVideoOptionHintsNeverOverridesExplicitValues(t *testing.T) {
+	inferredDuration := 12
+	inferredAspectRatio := "9:16"
+	inferredResolution := "1080p"
+	duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution := mergeVideoOptionHints(
+		6, true, "4:3", true, "480p", true,
+		gateway.VideoOptionHints{Duration: &inferredDuration, AspectRatio: &inferredAspectRatio, Resolution: &inferredResolution},
+	)
+	if duration != 6 || !hasDuration || aspectRatio != "4:3" || !hasAspectRatio || resolution != "480p" || !hasResolution {
+		t.Fatalf("explicit values overwritten: %d %t %s %t %s %t", duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution)
+	}
+
+	duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution = mergeVideoOptionHints(
+		0, false, "", false, "", false,
+		gateway.VideoOptionHints{Duration: &inferredDuration, AspectRatio: &inferredAspectRatio, Resolution: &inferredResolution},
+	)
+	if duration != 12 || !hasDuration || aspectRatio != "9:16" || !hasAspectRatio || resolution != "1080p" || !hasResolution {
+		t.Fatalf("missing values not filled: %d %t %s %t %s %t", duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution)
+	}
+}
+
 func TestWriteVideoContentRejectsDeclaredOversizeMedia(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -145,6 +223,104 @@ func TestVideoContentURLFollowsRuntimePublicAPIBase(t *testing.T) {
 	baseURL = "https://new.example.com/api/"
 	if got := handler.videoContentURL("video_request_2"); got != "https://new.example.com/api/v1/videos/video_request_2/content" {
 		t.Fatalf("updated URL = %q", got)
+	}
+}
+
+func TestWriteChatCompletionReturnsMediaMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	handler := NewHandler(nil, nil, 1<<20, "https://api.example.com")
+	content := "视频生成完成。\n\n[下载视频](" + handler.videoAssetURL("vid_request_1") + ")"
+
+	writeChatCompletion(context, "video_request_1", "grok-imagine-video", 123, content)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Object  string `json:"object"`
+		Choices []struct {
+			Message struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Object != "chat.completion" || len(response.Choices) != 1 || response.Choices[0].Message.Role != "assistant" || response.Choices[0].FinishReason != "stop" {
+		t.Fatalf("response=%#v", response)
+	}
+	responseContent := response.Choices[0].Message.Content
+	for _, want := range []string{
+		"视频生成完成",
+		"https://api.example.com/v1/media/videos/vid_request_1.mp4",
+	} {
+		if !strings.Contains(responseContent, want) {
+			t.Fatalf("content %q does not contain %q", responseContent, want)
+		}
+	}
+}
+
+func TestFinishChatCompletionStreamReturnsMediaMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	beginChatCompletionStream(context)
+
+	writeChatCompletionChunk(context.Writer, "video_request_2", "grok-imagine-video", 123, "视频生成进度：42%\n", nil)
+	finishChatCompletionStream(context.Writer, "video_request_2", "grok-imagine-video", 123, "视频生成完成。\n\n[下载视频](https://api.example.com/v1/media/videos/vid_request_2.mp4)")
+
+	if recorder.Code != http.StatusOK || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("status=%d content-type=%q", recorder.Code, recorder.Header().Get("Content-Type"))
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"object":"chat.completion.chunk"`,
+		`"role":"assistant"`,
+		`"finish_reason":"stop"`,
+		"视频生成进度：42%",
+		"https://api.example.com/v1/media/videos/vid_request_2.mp4",
+		"data: [DONE]\n\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream %q does not contain %q", body, want)
+		}
+	}
+}
+
+func TestImageChatCompletionContentRendersEveryImage(t *testing.T) {
+	content := imageChatCompletionContent([]string{
+		"https://api.example.com/v1/media/images/img_one",
+		"https://api.example.com/v1/media/images/img_two",
+	})
+	for _, want := range []string{
+		"图片生成完成",
+		"![生成图片 1](https://api.example.com/v1/media/images/img_one)",
+		"![生成图片 2](https://api.example.com/v1/media/images/img_two)",
+		"[下载原图 2](https://api.example.com/v1/media/images/img_two)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("content %q does not contain %q", content, want)
+		}
+	}
+}
+
+func TestReadImageChatResultReturnsPublicURLsAndFinalizes(t *testing.T) {
+	finalized := 0
+	result := &gateway.Result{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"created":123,"data":[{"url":"https://api.example.com/v1/media/images/img_one"}]}`)),
+		Finalize: func(gateway.Usage, string, string) {
+			finalized++
+		},
+	}
+	urls, err := readImageChatResult(result)
+	if err != nil || len(urls) != 1 || urls[0] != "https://api.example.com/v1/media/images/img_one" || finalized != 1 {
+		t.Fatalf("urls=%#v err=%v finalized=%d", urls, err, finalized)
 	}
 }
 

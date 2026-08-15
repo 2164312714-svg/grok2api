@@ -68,6 +68,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, ErrModelNotFound
 	}
+	routes = preferConsoleForDefaultVideo(input.PublicModel, routes)
 	route, err := s.selectMediaRoute(routes, input.ClientKey, model.CapabilityVideo, func(providerValue account.Provider) bool {
 		_, ok := s.providers.Videos(providerValue)
 		return ok
@@ -100,7 +101,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		Status: media.StatusQueued, Progress: 0, InputJSON: inputJSON, InputImageCount: len(input.ReferenceURLs), CreatedAt: now, UpdatedAt: now,
 	}
 	reserved := false
-	if pricing, ok := audit.EstimateOfficialVideoCost(externalModel, input.Resolution, input.Duration); ok {
+	if pricing, ok := audit.EstimateOfficialVideoCostWithInputs(externalModel, input.Resolution, input.Duration, len(input.ReferenceURLs)); ok {
 		reserved, err = s.clientKeys.ReserveBilling(ctx, input.ClientKey, "video_usage_"+job.ID, pricing.CostInUSDTicks, mediaBillingReservationTTL)
 		if err != nil {
 			return media.Job{}, err
@@ -116,6 +117,36 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		s.logger.Warn("video_job_queue_full", "job_id", job.ID)
 	}
 	return job, nil
+}
+
+// The unqualified legacy video ID is shared by Web and Console. Prefer the
+// official Console route while preserving explicit provider selections and
+// the existing fallback behavior enforced by selectMediaRoute.
+func preferConsoleForDefaultVideo(publicModel string, routes []model.Route) []model.Route {
+	if strings.TrimSpace(publicModel) != "grok-imagine-video" || len(routes) < 2 {
+		return routes
+	}
+	consoleCount := 0
+	for _, route := range routes {
+		if route.Provider == account.ProviderConsole {
+			consoleCount++
+		}
+	}
+	if consoleCount == 0 || consoleCount == len(routes) {
+		return routes
+	}
+	ordered := make([]model.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.Provider == account.ProviderConsole {
+			ordered = append(ordered, route)
+		}
+	}
+	for _, route := range routes {
+		if route.Provider != account.ProviderConsole {
+			ordered = append(ordered, route)
+		}
+	}
+	return ordered
 }
 
 func (s *Service) GetVideo(ctx context.Context, id string, key clientkey.Key) (media.Job, error) {
@@ -652,7 +683,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	if job.Status == media.StatusCompleted {
 		record.MediaOutputSeconds = int64(max(0, job.Seconds))
 	}
-	if pricing, ok := audit.EstimateOfficialVideoCost(job.Model, job.Quality, job.Seconds); ok && job.Status == media.StatusCompleted {
+	if pricing, ok := audit.EstimateOfficialVideoCostWithInputs(job.Model, job.Quality, job.Seconds, job.InputImageCount); ok && job.Status == media.StatusCompleted {
 		record.EstimatedCostInUSDTicks = pricing.CostInUSDTicks
 		record.PricingModel = pricing.Model
 		record.PricingVersion = audit.OfficialPricingAsOf

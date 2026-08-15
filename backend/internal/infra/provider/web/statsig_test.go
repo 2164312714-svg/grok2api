@@ -29,6 +29,47 @@ func TestExtractStatsigMetaContentAcceptsCurrentMetaName(t *testing.T) {
 	}
 }
 
+func TestFetchStatsigMetaContentPrefersImaginePage(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		if request.URL.Path != "/imagine" {
+			t.Fatalf("unexpected fallback request to %q", request.URL.Path)
+		}
+		if request.Header.Get("Sec-Fetch-Site") != "none" || request.Header.Get("Sec-Fetch-User") != "?1" {
+			t.Fatalf("navigation headers = %#v", request.Header)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="grok-site―verification" content="current-meta"></head></html>`)),
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+		}, nil
+	})}
+	value, err := fetchStatsigMetaContentWithClient(context.Background(), "https://grok.com", "token", "agent", "", client)
+	if err != nil || value != "current-meta" {
+		t.Fatalf("value=%q paths=%v err=%v", value, paths, err)
+	}
+}
+
+func TestFetchStatsigMetaContentFallsBackToRoot(t *testing.T) {
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.URL.Path)
+		if request.URL.Path == "/imagine" {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: http.Header{}}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`<html><head><meta name="grok-site-verification" content="root-meta"></head></html>`)),
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+		}, nil
+	})}
+	value, err := fetchStatsigMetaContentWithClient(context.Background(), "https://grok.com/", "token", "agent", "", client)
+	if err != nil || value != "root-meta" || fmt.Sprint(paths) != "[/imagine /]" {
+		t.Fatalf("value=%q paths=%v err=%v", value, paths, err)
+	}
+}
+
 func TestStatsigSignerSendsMethodPathAndMetaContent(t *testing.T) {
 	raw := make([]byte, 70)
 	encoded := base64.RawStdEncoding.EncodeToString(raw)
@@ -210,6 +251,37 @@ func TestStatsigWarmupFetchesMetaOnceForSharedPaths(t *testing.T) {
 	}
 	if warmedAgain, err := signer.Warm(context.Background(), "https://grok.com", "https://signer.example/sign", "token", nil, targets); err != nil || warmedAgain != 0 || fetches != 1 {
 		t.Fatalf("cached warmup=%d fetches=%d err=%v", warmedAgain, fetches, err)
+	}
+}
+
+func TestStatsigSignerSkipsMetaForInternalSigner(t *testing.T) {
+	var fetches int
+	signer := newStatsigSigner()
+	signer.validateEndpoint = func(context.Context, string) error { return nil }
+	signer.fetchMeta = func(context.Context, string, string, *infraegress.Lease) (string, error) {
+		fetches++
+		return "", errors.New("meta fetch must not run")
+	}
+	signer.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var payload struct {
+			Environment struct {
+				MetaContent string `json:"metaContent"`
+			} `json:"environment"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Environment.MetaContent != "" {
+			t.Fatalf("metaContent = %q", payload.Environment.MetaContent)
+		}
+		body, _ := json.Marshal(map[string]string{"x-statsig-id": base64.RawStdEncoding.EncodeToString(make([]byte, 70))})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}}, nil
+	})}
+	if _, _, err := signer.Sign(context.Background(), "https://grok.com", "http://grok2api-statsig-signer:8788/sign", "token", nil, http.MethodPost, "https://grok.com/rest/test"); err != nil {
+		t.Fatal(err)
+	}
+	if fetches != 0 {
+		t.Fatalf("meta fetches = %d", fetches)
 	}
 }
 

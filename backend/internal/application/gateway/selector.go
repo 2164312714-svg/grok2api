@@ -58,6 +58,13 @@ const softNetworkCooldown = 5 * time.Second
 
 const defaultFreeQuotaRecoveryPause = 24 * time.Hour
 
+type selectionStrategy string
+
+const (
+	selectionStrategyBalanced   selectionStrategy = "balanced"
+	selectionStrategySequential selectionStrategy = "sequential"
+)
+
 var errRoutingCredentialStale = errors.New("routing credential is no longer available")
 
 type quotaRecoveryHints struct {
@@ -261,6 +268,7 @@ type Selector struct {
 	cooldownBase           time.Duration
 	cooldownMax            time.Duration
 	capacityWait           time.Duration
+	selectionStrategy      selectionStrategy
 	preferFreeBuild        bool
 	excludeBuildBotFlagged bool
 	segmentedConfig        segmentedSelectorConfig
@@ -299,7 +307,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, selectionStrategy: selectionStrategyBalanced, leaseWake: make(chan struct{}), logger: slog.Default(), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), quotaConsumed: make(map[quotaConsumptionKey]int), staleFallbackLoggedAt: make(map[string]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 // SetLogger wires the application logger into routing degradation diagnostics.
@@ -326,6 +334,27 @@ func (s *Selector) UpdatePreferFreeBuild(value bool) {
 	s.configMu.Lock()
 	s.preferFreeBuild = value
 	s.configMu.Unlock()
+}
+
+// UpdateSelectionStrategy hot-switches between balanced spreading and stable
+// sequential account consumption. Invalid values retain the balanced default.
+func (s *Selector) UpdateSelectionStrategy(value string) {
+	strategy := selectionStrategy(value)
+	if strategy != selectionStrategySequential {
+		strategy = selectionStrategyBalanced
+	}
+	s.configMu.Lock()
+	s.selectionStrategy = strategy
+	s.configMu.Unlock()
+}
+
+func (s *Selector) currentSelectionStrategy() selectionStrategy {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	if s.selectionStrategy == selectionStrategySequential {
+		return selectionStrategySequential
+	}
+	return selectionStrategyBalanced
 }
 
 // UpdateSegmentedSelector changes the large-pool bounded planner policy.

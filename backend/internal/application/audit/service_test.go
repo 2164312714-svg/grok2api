@@ -621,7 +621,7 @@ func TestSummaryUsesOfficialPricesAndExcludesUnknownModels(t *testing.T) {
 	if result.Usage.Requests != 2 || result.Usage.SuccessfulRequests != 1 || result.Usage.TotalTokens != 1_500_150 {
 		t.Fatalf("usage = %#v", result.Usage)
 	}
-	if result.Usage.EstimatedCostInUSDTicks != 36_800_000_000 || result.Usage.PricedRequests != 1 || result.Usage.UnpricedRequests != 1 {
+	if result.Usage.EstimatedCostInUSDTicks != 36_800_000_000 || result.Usage.PricedRequests != 1 || result.Usage.UnpricedRequests != 0 {
 		t.Fatalf("pricing = %#v", result.Usage)
 	}
 	if result.Usage.AverageDurationMS != 200 || result.Usage.SuccessRate != 50 {

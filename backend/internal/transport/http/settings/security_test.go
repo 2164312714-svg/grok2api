@@ -158,6 +158,23 @@ func TestLegacySettingsRequestMayOmitSegmentedSelector(t *testing.T) {
 	}
 }
 
+func TestSelectionStrategySettingsPresenceIsPreserved(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		Routing: settingsapp.RoutingConfig{SelectionStrategy: "sequential"},
+	}})
+	if response.Config.Routing.SelectionStrategy == nil || *response.Config.Routing.SelectionStrategy != "sequential" {
+		t.Fatal("selectionStrategy was lost from settings response")
+	}
+
+	var legacy settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"routing":{"stickyTTL":"1h"}}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.toApplication().Routing.SelectionStrategyProvided {
+		t.Fatal("missing selectionStrategy was treated as an explicit update")
+	}
+}
+
 func TestSettingsResponseIncludesSegmentedSelector(t *testing.T) {
 	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
 		Routing: settingsapp.RoutingConfig{SegmentedSelector: settingsapp.SegmentedSelectorConfig{

@@ -28,6 +28,9 @@ const (
 	attemptInsertBatchSize = 40
 	auditSuccessPredicate  = "status_code >= 200 AND status_code < 300 AND (error_code IS NULL OR error_code = '')"
 	auditSuccessAggregate  = "COALESCE(SUM(CASE WHEN " + auditSuccessPredicate + " THEN 1 ELSE 0 END), 0)"
+	// Pricing coverage is about billable successful work, not every failed
+	// attempt that happened to lack a pricing model.
+	auditBillablePredicate = "(" + auditSuccessPredicate + ") AND (total_tokens > 0 OR media_output_images > 0 OR media_output_seconds > 0 OR cost_in_usd_ticks > 0 OR estimated_cost_in_usd_ticks > 0)"
 )
 
 var errAuditBatchRequiresFallback = errors.New("audit batch requires idempotent fallback")
@@ -667,10 +670,10 @@ func (r *AuditRepository) Summarize(ctx context.Context, input repository.AuditS
 		COALESCE(SUM(total_tokens), 0) AS total_tokens,
 		COALESCE(SUM(duration_ms), 0) AS duration_ms,
 		COALESCE(SUM(estimated_cost_in_usd_ticks), 0) AS estimated_cost_in_usd_ticks,
-		COALESCE(SUM(CASE WHEN COALESCE(pricing_model, '') <> '' THEN 1 ELSE 0 END), 0) AS priced_requests,
-		COALESCE(SUM(CASE WHEN COALESCE(pricing_model, '') = '' THEN 1 ELSE 0 END), 0) AS unpriced_requests,
-		COALESCE(SUM(CASE WHEN COALESCE(pricing_model, '') <> '' THEN total_tokens ELSE 0 END), 0) AS priced_tokens,
-		COALESCE(SUM(CASE WHEN COALESCE(pricing_model, '') = '' THEN total_tokens ELSE 0 END), 0) AS unpriced_tokens`).Scan(&aggregate).Error; err != nil {
+		COALESCE(SUM(CASE WHEN ` + auditBillablePredicate + ` AND (cost_in_usd_ticks > 0 OR COALESCE(pricing_model, '') <> '') THEN 1 ELSE 0 END), 0) AS priced_requests,
+		COALESCE(SUM(CASE WHEN ` + auditBillablePredicate + ` AND cost_in_usd_ticks = 0 AND COALESCE(pricing_model, '') = '' THEN 1 ELSE 0 END), 0) AS unpriced_requests,
+		COALESCE(SUM(CASE WHEN ` + auditBillablePredicate + ` AND (cost_in_usd_ticks > 0 OR COALESCE(pricing_model, '') <> '') THEN total_tokens ELSE 0 END), 0) AS priced_tokens,
+		COALESCE(SUM(CASE WHEN ` + auditBillablePredicate + ` AND cost_in_usd_ticks = 0 AND COALESCE(pricing_model, '') = '' THEN total_tokens ELSE 0 END), 0) AS unpriced_tokens`).Scan(&aggregate).Error; err != nil {
 		return audit.Summary{}, err
 	}
 	result := audit.Summary{

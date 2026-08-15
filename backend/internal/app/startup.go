@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -177,33 +176,20 @@ func readinessSnapshot(
 	required := make(map[accountdomain.Provider]bool, 3)
 	usable := make(map[accountdomain.Provider]bool, 3)
 	providerErrors := make(map[accountdomain.Provider]bool, 3)
-	now := time.Now().UTC()
 	for _, route := range routes {
 		required[route.Provider] = true
-		if usable[route.Provider] || route.SupportedAccounts == 0 {
+	}
+	// Readiness is intentionally provider-level. Loading every model route's
+	// routing candidates here repeatedly scans the full account pool and made
+	// the probe itself compete with inference and refresh work. HasActive uses
+	// indexed account/credential predicates and keeps the probe bounded.
+	for providerValue := range required {
+		active, activeErr := accounts.HasActive(ctx, providerValue)
+		if activeErr != nil {
+			providerErrors[providerValue] = true
 			continue
 		}
-		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.ID, route.UpstreamModel, providers.QuotaMode(route.Provider, route.UpstreamModel))
-		if listErr != nil {
-			providerErrors[route.Provider] = true
-			continue
-		}
-		for _, candidate := range candidates {
-			if !startupCandidateUsable(candidate, now, providers) {
-				continue
-			}
-			material, materialErr := accounts.GetCredentialMaterial(ctx, candidate.Credential.ID, candidate.Credential.Provider)
-			if materialErr != nil {
-				if !errors.Is(materialErr, repository.ErrNotFound) {
-					providerErrors[route.Provider] = true
-				}
-				continue
-			}
-			if material.EncryptedAccessToken != "" {
-				usable[route.Provider] = true
-				break
-			}
-		}
+		usable[providerValue] = active
 	}
 
 	readyProviders := 0

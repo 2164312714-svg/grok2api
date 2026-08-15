@@ -2,6 +2,7 @@ package inference
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/pkg/imagecontext"
 	"github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	"github.com/gin-gonic/gin"
@@ -108,6 +110,20 @@ type chatCompletionRequest struct {
 	PromptCacheKey string `json:"prompt_cache_key"`
 }
 
+type contextualImageConfig struct {
+	Count          *int   `json:"n"`
+	Size           string `json:"size"`
+	AspectRatio    string `json:"aspect_ratio"`
+	Resolution     string `json:"resolution"`
+	ResponseFormat string `json:"response_format"`
+}
+
+type contextualImageRequest struct {
+	Model       string                 `json:"model"`
+	Stream      bool                   `json:"stream"`
+	ImageConfig *contextualImageConfig `json:"image_config"`
+}
+
 type messagesRequest struct {
 	Model          string          `json:"model"`
 	MaxTokens      *int            `json:"max_tokens"`
@@ -119,6 +135,7 @@ type messagesRequest struct {
 type imageGenerationRequest struct {
 	Model          string          `json:"model"`
 	Prompt         string          `json:"prompt"`
+	Messages       json.RawMessage `json:"messages"`
 	Count          *int            `json:"n"`
 	PartialImages  *int            `json:"partial_images"`
 	Size           string          `json:"size"`
@@ -137,6 +154,8 @@ type imageEditJSONImage struct {
 type imageEditJSONRequest struct {
 	Model          string               `json:"model"`
 	Prompt         string               `json:"prompt"`
+	Messages       json.RawMessage      `json:"messages"`
+	Input          json.RawMessage      `json:"input"`
 	Image          *imageEditJSONImage  `json:"image"`
 	Images         []imageEditJSONImage `json:"images"`
 	Count          *int                 `json:"n"`
@@ -155,16 +174,43 @@ type videoGenerationImage struct {
 }
 
 type videoGenerationRequest struct {
-	Model           string                 `json:"model"`
-	Prompt          string                 `json:"prompt"`
-	User            *string                `json:"user"`
-	Duration        json.RawMessage        `json:"duration"`
-	AspectRatio     string                 `json:"aspect_ratio"`
-	Resolution      string                 `json:"resolution"`
-	Image           *videoGenerationImage  `json:"image"`
-	ReferenceImages []videoGenerationImage `json:"reference_images"`
-	Output          json.RawMessage        `json:"output"`
-	StorageOptions  json.RawMessage        `json:"storage_options"`
+	Model               string                 `json:"model"`
+	Prompt              string                 `json:"prompt"`
+	Messages            json.RawMessage        `json:"messages"`
+	Stream              *bool                  `json:"stream"`
+	Temperature         *float64               `json:"temperature"`
+	TopP                *float64               `json:"top_p"`
+	MaxTokens           *int                   `json:"max_tokens"`
+	MaxCompletionTokens *int                   `json:"max_completion_tokens"`
+	PresencePenalty     *float64               `json:"presence_penalty"`
+	FrequencyPenalty    *float64               `json:"frequency_penalty"`
+	Stop                json.RawMessage        `json:"stop"`
+	Seed                *int64                 `json:"seed"`
+	Logprobs            *bool                  `json:"logprobs"`
+	TopLogprobs         *int                   `json:"top_logprobs"`
+	Tools               json.RawMessage        `json:"tools"`
+	ToolChoice          json.RawMessage        `json:"tool_choice"`
+	ParallelToolCalls   *bool                  `json:"parallel_tool_calls"`
+	ResponseFormat      json.RawMessage        `json:"response_format"`
+	ReasoningEffort     string                 `json:"reasoning_effort"`
+	LogitBias           json.RawMessage        `json:"logit_bias"`
+	Metadata            json.RawMessage        `json:"metadata"`
+	Modalities          json.RawMessage        `json:"modalities"`
+	Count               *int                   `json:"n"`
+	Prediction          json.RawMessage        `json:"prediction"`
+	ServiceTier         string                 `json:"service_tier"`
+	Store               *bool                  `json:"store"`
+	StreamOptions       json.RawMessage        `json:"stream_options"`
+	Verbosity           string                 `json:"verbosity"`
+	WebSearchOptions    json.RawMessage        `json:"web_search_options"`
+	User                *string                `json:"user"`
+	Duration            json.RawMessage        `json:"duration"`
+	AspectRatio         string                 `json:"aspect_ratio"`
+	Resolution          string                 `json:"resolution"`
+	Image               *videoGenerationImage  `json:"image"`
+	ReferenceImages     []videoGenerationImage `json:"reference_images"`
+	Output              json.RawMessage        `json:"output"`
+	StorageOptions      json.RawMessage        `json:"storage_options"`
 }
 
 type modelListItem struct {
@@ -297,6 +343,9 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 	}
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
+	if h.tryContextualImageEdit(c, body, request.Model, conversationOperationChat, clientKey, requestIDValue, request.Stream) {
+		return
+	}
 	result, err := h.gateway.CreateChatCompletion(c.Request.Context(), gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,
@@ -310,6 +359,250 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolChat)
 }
+
+func (h *Handler) tryContextualImageEdit(c *gin.Context, body []byte, publicModel, operation string, clientKey clientkeydomain.Key, requestID string, stream bool) bool {
+	if h.models == nil || h.gateway == nil || !h.modelHasCapability(c.Request.Context(), publicModel, modeldomain.CapabilityImageEdit) {
+		return false
+	}
+	contextValue, err := imagecontext.Parse(body, operation)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑上下文无效: "+err.Error())
+		return true
+	}
+	if len(contextValue.Candidates) == 0 {
+		// A model can expose both generation and edit capabilities. Without a real
+		// image candidate, leave the request to its existing generation/chat path.
+		if h.modelHasCapability(c.Request.Context(), publicModel, modeldomain.CapabilityImage) {
+			return false
+		}
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑上下文中没有真实输入图片；请在当前消息或历史助手消息中提供图片")
+		return true
+	}
+	if len(contextValue.CurrentCandidates) == 0 && h.modelHasCapability(c.Request.Context(), publicModel, modeldomain.CapabilityImage) {
+		// A dual-capability image model remains stateless for assistant-image
+		// replay. Only an image explicitly attached to the current user turn
+		// opts into editing.
+		return false
+	}
+	var request contextualImageRequest
+	if json.Unmarshal(body, &request) != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑请求 JSON 无效")
+		return true
+	}
+	count := 1
+	aspectRatio := ""
+	resolution := ""
+	size := ""
+	if request.ImageConfig != nil {
+		if request.ImageConfig.Count != nil {
+			count = *request.ImageConfig.Count
+		}
+		aspectRatio = strings.ToLower(strings.TrimSpace(request.ImageConfig.AspectRatio))
+		resolution = strings.ToLower(strings.TrimSpace(request.ImageConfig.Resolution))
+		size = strings.ToLower(strings.TrimSpace(request.ImageConfig.Size))
+	}
+	if count < 1 || count > 10 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "image_config.n 必须在 1 到 10 之间")
+		return true
+	}
+	if aspectRatio != "" && !validImageAspectRatio(aspectRatio) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "image_config.aspect_ratio 不受支持")
+		return true
+	}
+	if size != "" && !validImageEditSize(size) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "image_config.size 必须是 auto、1024x1024、1024x1536 或 1536x1024")
+		return true
+	}
+	if resolution != "" && resolution != "1k" && resolution != "2k" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "image_config.resolution 必须是 1k 或 2k")
+		return true
+	}
+	hints, inferErr := h.gateway.InferImageEditOptions(c.Request.Context(), gateway.ImageEditOptionParseInput{
+		RequestID: requestID, ClientKey: clientKey, Instruction: contextValue.Prompt, Candidates: contextValue.Candidates,
+		NeedPrompt: false, NeedImageSelection: true,
+		NeedAspectRatio: aspectRatio == "", NeedResolution: resolution == "", NeedSize: size == "",
+	})
+	prompt := strings.TrimSpace(contextValue.Prompt)
+	imageURLs := []string(nil)
+	if inferErr == nil {
+		imageURLs = selectImageEditCandidateURLs(contextValue.Candidates, hints.ImageIndexes)
+		if aspectRatio == "" && hints.AspectRatio != nil {
+			aspectRatio = strings.ToLower(strings.TrimSpace(*hints.AspectRatio))
+		}
+		if resolution == "" && hints.Resolution != nil {
+			resolution = strings.ToLower(strings.TrimSpace(*hints.Resolution))
+		}
+		if size == "" && hints.Size != nil {
+			size = strings.ToLower(strings.TrimSpace(*hints.Size))
+		}
+	}
+	if prompt == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑当前用户消息中没有有效编辑指令")
+		return true
+	}
+	if len(imageURLs) == 0 {
+		imageURLs = []string{contextValue.Candidates[0].URL}
+	}
+	if resolution == "" {
+		resolution = "1k"
+	}
+	created := time.Now().Unix()
+	if stream {
+		if operation == conversationOperationResponses {
+			beginImageEditResponsesStream(c, requestID, publicModel, created)
+		} else {
+			beginChatCompletionStream(c)
+			writeChatCompletionChunk(c.Writer, requestID, publicModel, created, "图片编辑已开始。\n", nil)
+		}
+	}
+	result, editErr := h.editImageWithContextHeartbeat(c, gateway.ImageEditInput{
+		RequestID: requestID, ClientKey: clientKey, PublicModel: publicModel, Prompt: prompt,
+		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio, Resolution: resolution,
+		ResponseFormat: "url", Streaming: false,
+	}, requestID, publicModel, created, operation, stream)
+	if editErr != nil {
+		if stream {
+			h.finishContextualImageEdit(c, requestID, publicModel, created, operation, true, "图片编辑失败，请稍后重试。")
+		} else {
+			writeGatewayError(c, editErr)
+		}
+		return true
+	}
+	urls, readErr := readImageChatResult(result)
+	if readErr != nil {
+		if stream {
+			h.finishContextualImageEdit(c, requestID, publicModel, created, operation, true, "图片编辑失败，请稍后重试。")
+		} else {
+			writeOpenAIError(c, http.StatusBadGateway, "image_edit_failed", "图片编辑失败，请稍后重试")
+		}
+		return true
+	}
+	h.finishContextualImageEdit(c, requestID, publicModel, created, operation, stream, imageEditCompletionContent(urls))
+	return true
+}
+
+func (h *Handler) modelHasCapability(ctx context.Context, publicModel string, capability modeldomain.Capability) bool {
+	routes, err := h.models.GetByPublicIDCandidates(ctx, strings.TrimSpace(publicModel))
+	if err != nil {
+		return false
+	}
+	for _, route := range routes {
+		if route.Enabled && route.Capability == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) editImageWithContextHeartbeat(c *gin.Context, input gateway.ImageEditInput, id, model string, created int64, operation string, heartbeat bool) (*gateway.Result, error) {
+	if !heartbeat {
+		return h.gateway.EditImage(c.Request.Context(), input)
+	}
+	type outcome struct {
+		result *gateway.Result
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := h.gateway.EditImage(c.Request.Context(), input)
+		completed <- outcome{result: result, err: err}
+	}()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case value := <-completed:
+			return value.result, value.err
+		case <-ticker.C:
+			if operation == conversationOperationResponses {
+				writeImageEditResponsesTextDelta(c.Writer, id, "图片仍在编辑。\n")
+			} else {
+				writeChatCompletionChunk(c.Writer, id, model, created, "图片仍在编辑。\n", nil)
+			}
+		case <-c.Request.Context().Done():
+			return nil, c.Request.Context().Err()
+		}
+	}
+}
+
+func imageEditCompletionContent(urls []string) string {
+	var content strings.Builder
+	content.WriteString("图片编辑完成。")
+	for index, value := range urls {
+		fmt.Fprintf(&content, "\n\n![编辑图片 %d](%s)\n[下载原图 %d](%s)", index+1, value, index+1, value)
+	}
+	return content.String()
+}
+
+func (h *Handler) finishContextualImageEdit(c *gin.Context, id, model string, created int64, operation string, stream bool, content string) {
+	if operation == conversationOperationResponses {
+		if stream {
+			finishImageEditResponsesStream(c.Writer, id, model, created, content)
+			return
+		}
+		c.JSON(http.StatusOK, imageEditResponsesResult(id, model, created, content))
+		return
+	}
+	if stream {
+		finishChatCompletionStream(c.Writer, id, model, created, content)
+		return
+	}
+	writeChatCompletion(c, id, model, created, content)
+}
+
+func imageEditResponsesResult(id, model string, created int64, content string) gin.H {
+	messageID := "msg_" + strings.TrimPrefix(id, "resp_")
+	return gin.H{
+		"id": id, "object": "response", "created_at": created, "status": "completed", "model": model,
+		"output": []gin.H{{
+			"id": messageID, "type": "message", "status": "completed", "role": "assistant",
+			"content": []gin.H{{"type": "output_text", "text": content, "annotations": []any{}}},
+		}},
+		"usage": gin.H{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+	}
+}
+
+func beginImageEditResponsesStream(c *gin.Context, id, model string, created int64) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	writeResponseSSE(c.Writer, "response.created", gin.H{
+		"type": "response.created", "response": gin.H{
+			"id": id, "object": "response", "created_at": created, "status": "in_progress", "model": model, "output": []any{},
+		},
+	})
+}
+
+func writeImageEditResponsesTextDelta(writer gin.ResponseWriter, id, content string) {
+	writeResponseSSE(writer, "response.output_text.delta", gin.H{
+		"type": "response.output_text.delta", "response_id": id, "output_index": 0, "content_index": 0, "delta": content,
+	})
+}
+
+func finishImageEditResponsesStream(writer gin.ResponseWriter, id, model string, created int64, content string) {
+	writeImageEditResponsesTextDelta(writer, id, content)
+	writeResponseSSE(writer, "response.completed", gin.H{"type": "response.completed", "response": imageEditResponsesResult(id, model, created, content)})
+	writer.Flush()
+}
+
+func writeResponseSSE(writer gin.ResponseWriter, event string, value any) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	_, _ = writer.WriteString("event: " + event + "\n")
+	_, _ = writer.WriteString("data: ")
+	_, _ = writer.Write(data)
+	_, _ = writer.WriteString("\n\n")
+	writer.Flush()
+}
+
+const (
+	conversationOperationChat      = "chat"
+	conversationOperationResponses = "responses"
+)
 
 func (h *Handler) createMessage(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
@@ -360,7 +653,22 @@ func (h *Handler) generateImage(c *gin.Context) {
 		return
 	}
 	var request imageGenerationRequest
-	if decodeSingleJSON(c.Request.Body, &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
+	if decodeSingleJSON(c.Request.Body, &request, false) != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片请求缺少有效 model 或 prompt")
+		return
+	}
+	model := strings.TrimSpace(request.Model)
+	prompt := strings.TrimSpace(request.Prompt)
+	chatStyle := hasJSONValue(request.Messages)
+	if prompt == "" {
+		var err error
+		prompt, err = extractVideoPromptFromMessages(request.Messages)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片生成 messages 无效: "+err.Error())
+			return
+		}
+	}
+	if model == "" || prompt == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片请求缺少有效 model 或 prompt")
 		return
 	}
@@ -376,7 +684,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 		}
 		count = *request.Count
 	}
-	if request.Stream && count != 1 {
+	if request.Stream && count != 1 && !chatStyle {
 		writeImageGenerationUserError(c, "unsupported_parameter", "input", "Streaming is only supported with n=1.")
 		return
 	}
@@ -396,17 +704,128 @@ func (h *Handler) generateImage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
-		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
+	created := time.Now().Unix()
+	if chatStyle && request.Stream {
+		beginChatCompletionStream(c)
+		writeChatCompletionChunk(c.Writer, requestID, model, created, "图片生成已开始。\n", nil)
+	}
+	responseFormat := request.ResponseFormat
+	streamUpstream := request.Stream
+	if chatStyle {
+		responseFormat = "url"
+		streamUpstream = false
+		partialImages = 0
+	}
+	imageInput := gateway.ImageGenerationInput{
+		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
-		Resolution: request.Resolution, ResponseFormat: request.ResponseFormat,
-		Streaming: request.Stream, PartialImages: partialImages,
-	})
+		Resolution: request.Resolution, ResponseFormat: responseFormat,
+		Streaming: streamUpstream, PartialImages: partialImages,
+	}
+	result, err := h.generateImageWithChatHeartbeat(c, imageInput, requestID, model, created, chatStyle && request.Stream)
 	if err != nil {
+		if chatStyle && request.Stream {
+			finishChatCompletionStream(c.Writer, requestID, model, created, "图片生成失败，请稍后重试。")
+			return
+		}
 		writeGatewayError(c, err)
 		return
 	}
+	if chatStyle {
+		urls, readErr := readImageChatResult(result)
+		if readErr != nil {
+			if request.Stream {
+				finishChatCompletionStream(c.Writer, requestID, model, created, "图片生成失败，请稍后重试。")
+				return
+			}
+			writeOpenAIError(c, http.StatusBadGateway, "image_generation_failed", "图片生成失败，请稍后重试")
+			return
+		}
+		content := imageChatCompletionContent(urls)
+		if request.Stream {
+			finishChatCompletionStream(c.Writer, requestID, model, created, content)
+			return
+		}
+		writeChatCompletion(c, requestID, model, created, content)
+		return
+	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+func (h *Handler) generateImageWithChatHeartbeat(c *gin.Context, input gateway.ImageGenerationInput, id, model string, created int64, heartbeat bool) (*gateway.Result, error) {
+	if !heartbeat {
+		return h.gateway.GenerateImage(c.Request.Context(), input)
+	}
+	type outcome struct {
+		result *gateway.Result
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := h.gateway.GenerateImage(c.Request.Context(), input)
+		completed <- outcome{result: result, err: err}
+	}()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case value := <-completed:
+			return value.result, value.err
+		case <-ticker.C:
+			writeChatCompletionChunk(c.Writer, id, model, created, "图片仍在生成。\n", nil)
+		case <-c.Request.Context().Done():
+			return nil, c.Request.Context().Err()
+		}
+	}
+}
+
+func readImageChatResult(result *gateway.Result) ([]string, error) {
+	usage := gateway.Usage{}
+	responseID := ""
+	errorCode := ""
+	defer result.Body.Close()
+	defer func() { result.Finalize(usage, responseID, errorCode) }()
+	body, err := io.ReadAll(io.LimitReader(result.Body, maxJSONResponseTransferBytes+1))
+	if err != nil || len(body) > maxJSONResponseTransferBytes {
+		errorCode = "image_response_invalid"
+		return nil, errors.New("图片响应读取失败")
+	}
+	metadata := extractMetadata(body)
+	usage, responseID = metadata.Usage, metadata.ResponseID
+	if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
+		errorCode = "upstream_error"
+		return nil, errors.New("图片上游响应失败")
+	}
+	var payload struct {
+		Data []struct {
+			URL string `json:"url"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		errorCode = "image_response_invalid"
+		return nil, errors.New("图片响应格式无效")
+	}
+	urls := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		value := strings.TrimSpace(item.URL)
+		if value != "" {
+			urls = append(urls, value)
+		}
+	}
+	if len(urls) == 0 {
+		errorCode = "image_response_invalid"
+		return nil, errors.New("图片响应没有媒体地址")
+	}
+	return urls, nil
+}
+
+func imageChatCompletionContent(urls []string) string {
+	var content strings.Builder
+	content.WriteString("图片生成完成。")
+	for index, value := range urls {
+		fmt.Fprintf(&content, "\n\n![生成图片 %d](%s)\n[下载原图 %d](%s)", index+1, value, index+1, value)
+	}
+	return content.String()
 }
 
 func (h *Handler) writeMediaResult(c *gin.Context, result *gateway.Result) {
@@ -521,7 +940,7 @@ func (h *Handler) editImage(c *gin.Context) {
 	if request.Image != nil {
 		inputs = append([]imageEditJSONImage{*request.Image}, inputs...)
 	}
-	if len(inputs) == 0 || len(inputs) > 8 {
+	if len(inputs) > 8 {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images 数量必须在 1 到 8 之间")
 		return
 	}
@@ -539,8 +958,18 @@ func (h *Handler) editImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 都必须提供有效 url")
 		return
 	}
-	if model == "" || prompt == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑缺少有效 model 或 prompt")
+	if model == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑缺少有效 model")
+		return
+	}
+	contextOperation := ""
+	if hasJSONValue(request.Messages) {
+		contextOperation = "chat"
+	} else if hasJSONValue(request.Input) {
+		contextOperation = "responses"
+	}
+	if len(imageURLs) == 0 && contextOperation == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images 数量必须在 1 到 8 之间；也可以通过 messages 或 input 提供上下文图片")
 		return
 	}
 	if count < 1 || count > 10 {
@@ -561,6 +990,7 @@ func (h *Handler) editImage(c *gin.Context) {
 	}
 	aspectRatio := strings.ToLower(strings.TrimSpace(request.AspectRatio))
 	size := strings.ToLower(strings.TrimSpace(request.Size))
+	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
 	if aspectRatio != "" && !validImageAspectRatio(aspectRatio) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "aspect_ratio 不受支持")
 		return
@@ -569,16 +999,78 @@ func (h *Handler) editImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "size 必须是 auto、1024x1024、1024x1536 或 1536x1024")
 		return
 	}
-	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
-	if resolution == "" {
-		resolution = "1k"
-	}
-	if resolution != "1k" && resolution != "2k" {
+	if resolution != "" && resolution != "1k" && resolution != "2k" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "resolution 必须是 1k 或 2k")
 		return
 	}
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
+		return
+	}
+	if contextOperation != "" && (len(imageURLs) == 0 || prompt == "" || aspectRatio == "" || resolution == "" || size == "") {
+		contextValue, contextErr := imagecontext.ParseValues(request.Messages, request.Input, contextOperation)
+		if contextErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑上下文无效: "+contextErr.Error())
+			return
+		}
+		instruction := strings.TrimSpace(contextValue.Prompt)
+		if prompt == "" {
+			prompt = instruction
+		}
+		if instruction == "" {
+			instruction = prompt
+		}
+		if len(imageURLs) == 0 && len(contextValue.Candidates) == 0 {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑上下文中没有真实输入图片；请在当前消息或历史助手消息中提供图片")
+			return
+		}
+		hints, inferErr := h.gateway.InferImageEditOptions(c.Request.Context(), gateway.ImageEditOptionParseInput{
+			RequestID: requestID, ClientKey: clientKey, Instruction: instruction, Candidates: contextValue.Candidates,
+			NeedPrompt: false, NeedImageSelection: len(imageURLs) == 0,
+			NeedAspectRatio: aspectRatio == "", NeedResolution: resolution == "", NeedSize: size == "",
+		})
+		if inferErr == nil {
+			if len(imageURLs) == 0 {
+				imageURLs = selectImageEditCandidateURLs(contextValue.Candidates, hints.ImageIndexes)
+			}
+			if aspectRatio == "" && hints.AspectRatio != nil {
+				aspectRatio = strings.ToLower(strings.TrimSpace(*hints.AspectRatio))
+			}
+			if resolution == "" && hints.Resolution != nil {
+				resolution = strings.ToLower(strings.TrimSpace(*hints.Resolution))
+			}
+			if size == "" && hints.Size != nil {
+				size = strings.ToLower(strings.TrimSpace(*hints.Size))
+			}
+		}
+		if prompt == "" {
+			prompt = instruction
+		}
+		if len(imageURLs) == 0 && len(contextValue.Candidates) > 0 {
+			imageURLs = []string{contextValue.Candidates[0].URL}
+		}
+	}
+	if prompt == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑缺少有效 prompt 或当前用户编辑指令")
+		return
+	}
+	if len(imageURLs) == 0 || len(imageURLs) > 8 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images 数量必须在 1 到 8 之间")
+		return
+	}
+	if aspectRatio != "" && !validImageAspectRatio(aspectRatio) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "aspect_ratio 不受支持")
+		return
+	}
+	if size != "" && !validImageEditSize(size) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "size 必须是 auto、1024x1024、1024x1536 或 1536x1024")
+		return
+	}
+	if resolution == "" {
+		resolution = "1k"
+	}
+	if resolution != "1k" && resolution != "2k" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "resolution 必须是 1k 或 2k")
 		return
 	}
 	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
@@ -592,6 +1084,26 @@ func (h *Handler) editImage(c *gin.Context) {
 		return
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+func selectImageEditCandidateURLs(candidates []imagecontext.Candidate, indexes []int) []string {
+	result := make([]string, 0, len(indexes))
+	seen := make(map[string]struct{}, len(indexes))
+	for _, index := range indexes {
+		if index < 0 || index >= len(candidates) {
+			continue
+		}
+		value := strings.TrimSpace(candidates[index].URL)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func requestIdentity(c *gin.Context) (clientkeydomain.Key, string, bool) {
@@ -625,30 +1137,38 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前兼容层暂不支持 storage_options")
 		return
 	}
-	duration, err := parseVideoDuration(request.Duration)
+	duration, hasDuration, err := parseOptionalVideoInteger(request.Duration)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "duration 必须是整数或整数字符串")
+		return
+	}
+	if hasDuration && (duration < 1 || duration > 15) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "duration 必须在 1 到 15 秒之间")
 		return
 	}
 	model := strings.TrimSpace(request.Model)
 	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" {
+		var err error
+		prompt, err = extractVideoPromptFromMessages(request.Messages)
+		if err != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成 messages 无效: "+err.Error())
+			return
+		}
+	}
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成缺少有效 model")
 		return
 	}
 	aspectRatio := strings.TrimSpace(request.AspectRatio)
-	if aspectRatio == "" {
-		aspectRatio = "16:9"
-	}
-	if !validVideoAspectRatio(aspectRatio) {
+	hasAspectRatio := aspectRatio != ""
+	if hasAspectRatio && !validVideoAspectRatio(aspectRatio) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "aspect_ratio 必须是 1:1、16:9、9:16、4:3、3:4、3:2 或 2:3")
 		return
 	}
 	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
-	if resolution == "" {
-		resolution = "720p"
-	}
-	if resolution != "480p" && resolution != "720p" && resolution != "1080p" {
+	hasResolution := resolution != ""
+	if hasResolution && resolution != "480p" && resolution != "720p" && resolution != "1080p" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "resolution 必须是 480p、720p 或 1080p")
 		return
 	}
@@ -686,6 +1206,26 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if prompt != "" && (!hasDuration || !hasAspectRatio || !hasResolution) {
+		hints, inferErr := h.gateway.InferVideoOptions(c.Request.Context(), gateway.VideoOptionParseInput{
+			RequestID: requestID, ClientKey: clientKey, Prompt: prompt,
+			NeedDuration: !hasDuration, NeedAspectRatio: !hasAspectRatio, NeedResolution: !hasResolution,
+		})
+		if inferErr == nil {
+			duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution = mergeVideoOptionHints(
+				duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution, hints,
+			)
+		}
+	}
+	if !hasDuration {
+		duration = 8
+	}
+	if !hasAspectRatio {
+		aspectRatio = "16:9"
+	}
+	if !hasResolution {
+		resolution = "720p"
+	}
 	job, err := h.gateway.CreateVideo(c.Request.Context(), gateway.VideoInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
 		Prompt: prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
@@ -695,7 +1235,173 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
+	if hasJSONValue(request.Messages) {
+		h.writeVideoChatResult(c, job, clientKey, model, request.Stream != nil && *request.Stream)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+}
+
+func (h *Handler) writeVideoChatResult(c *gin.Context, job mediadomain.Job, clientKey clientkeydomain.Key, model string, stream bool) {
+	created := time.Now().Unix()
+	if stream {
+		beginChatCompletionStream(c)
+		writeChatCompletionChunk(c.Writer, job.ID, model, created, "视频生成已开始。\n", nil)
+	}
+	lastProgress := -1
+	lastProgressSentAt := time.Time{}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		current, err := h.gateway.GetVideo(c.Request.Context(), job.ID, clientKey)
+		if err != nil {
+			h.finishVideoChat(c, job.ID, model, created, stream, "视频生成状态读取失败，请稍后重试。")
+			return
+		}
+		switch current.Status {
+		case mediadomain.StatusCompleted:
+			if current.ResultAssetID == "" {
+				h.finishVideoChat(c, job.ID, model, created, stream, "视频已生成，但媒体归档尚未完成，请稍后重试。")
+				return
+			}
+			mediaURL := h.videoAssetURL(current.ResultAssetID)
+			content := fmt.Sprintf("视频生成完成。\n\n<video controls src=\"%s\"></video>\n\n[下载视频](%s)", mediaURL, mediaURL)
+			h.finishVideoChat(c, job.ID, model, created, stream, content)
+			return
+		case mediadomain.StatusFailed:
+			message := "视频生成失败，请稍后重试。"
+			if strings.TrimSpace(current.ErrorMessage) != "" {
+				message = "视频生成失败：" + strings.TrimSpace(current.ErrorMessage)
+			}
+			h.finishVideoChat(c, job.ID, model, created, stream, message)
+			return
+		default:
+			progress := min(99, max(0, current.Progress))
+			if stream && (progress != lastProgress || time.Since(lastProgressSentAt) >= 15*time.Second) {
+				prefix := "视频生成进度"
+				if progress == lastProgress {
+					prefix = "视频仍在生成"
+				}
+				writeChatCompletionChunk(c.Writer, job.ID, model, created, fmt.Sprintf("%s：%d%%\n", prefix, progress), nil)
+				lastProgress = progress
+				lastProgressSentAt = time.Now()
+			}
+		}
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Handler) finishVideoChat(c *gin.Context, id, model string, created int64, stream bool, content string) {
+	if stream {
+		finishChatCompletionStream(c.Writer, id, model, created, content)
+		return
+	}
+	writeChatCompletion(c, id, model, created, content)
+}
+
+func beginChatCompletionStream(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+}
+
+func writeChatCompletion(c *gin.Context, id, model string, created int64, content string) {
+	c.JSON(http.StatusOK, gin.H{
+		"id": id, "object": "chat.completion", "created": created, "model": model,
+		"choices": []gin.H{{"index": 0, "message": gin.H{"role": "assistant", "content": content}, "finish_reason": "stop"}},
+	})
+}
+
+func finishChatCompletionStream(writer gin.ResponseWriter, id, model string, created int64, content string) {
+	writeChatCompletionChunk(writer, id, model, created, content, nil)
+	finishReason := "stop"
+	writeChatCompletionChunk(writer, id, model, created, "", &finishReason)
+	_, _ = writer.WriteString("data: [DONE]\n\n")
+	writer.Flush()
+}
+
+func writeChatCompletionChunk(writer gin.ResponseWriter, id, model string, created int64, content string, finishReason *string) {
+	delta := gin.H{}
+	if content != "" {
+		delta = gin.H{"role": "assistant", "content": content}
+	}
+	chunk := gin.H{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []gin.H{{"index": 0, "delta": delta, "finish_reason": finishReason}},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	_, _ = writer.WriteString("data: ")
+	_, _ = writer.Write(data)
+	_, _ = writer.WriteString("\n\n")
+	writer.Flush()
+}
+
+func mergeVideoOptionHints(duration int, hasDuration bool, aspectRatio string, hasAspectRatio bool, resolution string, hasResolution bool, hints gateway.VideoOptionHints) (int, bool, string, bool, string, bool) {
+	if !hasDuration && hints.Duration != nil {
+		duration = *hints.Duration
+		hasDuration = true
+	}
+	if !hasAspectRatio && hints.AspectRatio != nil {
+		aspectRatio = *hints.AspectRatio
+		hasAspectRatio = true
+	}
+	if !hasResolution && hints.Resolution != nil {
+		resolution = *hints.Resolution
+		hasResolution = true
+	}
+	return duration, hasDuration, aspectRatio, hasAspectRatio, resolution, hasResolution
+}
+
+func extractVideoPromptFromMessages(raw json.RawMessage) (string, error) {
+	if !hasJSONValue(raw) {
+		return "", nil
+	}
+	var messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return "", errors.New("必须是消息数组")
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if !strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			continue
+		}
+		return extractVideoMessageText(messages[i].Content), nil
+	}
+	return "", nil
+}
+
+func extractVideoMessageText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		partType := strings.ToLower(strings.TrimSpace(part.Type))
+		value := strings.TrimSpace(part.Text)
+		if value != "" && (partType == "text" || partType == "input_text") {
+			texts = append(texts, value)
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 func (h *Handler) getVideo(c *gin.Context) {
@@ -712,7 +1418,18 @@ func (h *Handler) getVideo(c *gin.Context) {
 }
 
 func (h *Handler) videoContentURL(jobID string) string {
-	path := "/v1/videos/" + url.PathEscape(jobID) + "/content"
+	return h.videoURL(jobID, "/content")
+}
+
+func (h *Handler) videoAssetURL(assetID string) string {
+	return h.publicURL("/v1/media/videos/" + url.PathEscape(assetID) + ".mp4")
+}
+
+func (h *Handler) videoURL(jobID, suffix string) string {
+	return h.publicURL("/v1/videos/" + url.PathEscape(jobID) + suffix)
+}
+
+func (h *Handler) publicURL(path string) string {
 	baseURL := h.publicAPIBaseURL
 	if h.publicBaseURL != nil {
 		baseURL = strings.TrimRight(strings.TrimSpace(h.publicBaseURL()), "/")
@@ -891,6 +1608,9 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 	}
 	requestID, _ := c.Get(middleware.RequestIDKey)
 	requestIDValue, _ := requestID.(string)
+	if !compact && h.tryContextualImageEdit(c, body, request.Model, conversationOperationResponses, clientKey, requestIDValue, request.Stream) {
+		return
+	}
 	input := gateway.Input{
 		RequestID: requestIDValue, ClientKey: clientKey, PublicModel: request.Model,
 		Body: body, Streaming: request.Stream, PromptCacheKey: request.PromptCacheKey,

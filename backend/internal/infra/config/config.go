@@ -210,12 +210,13 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL       Duration `yaml:"stickyTTL"`
-	CooldownBase    Duration `yaml:"cooldownBase"`
-	CooldownMax     Duration `yaml:"cooldownMax"`
-	CapacityWait    Duration `yaml:"capacityWait"`
-	MaxAttempts     int      `yaml:"maxAttempts"`
-	PreferFreeBuild bool     `yaml:"preferFreeBuild"`
+	StickyTTL         Duration `yaml:"stickyTTL"`
+	CooldownBase      Duration `yaml:"cooldownBase"`
+	CooldownMax       Duration `yaml:"cooldownMax"`
+	CapacityWait      Duration `yaml:"capacityWait"`
+	MaxAttempts       int      `yaml:"maxAttempts"`
+	SelectionStrategy string   `yaml:"selectionStrategy"`
+	PreferFreeBuild   bool     `yaml:"preferFreeBuild"`
 	// MarkBuildChatDeniedAsReauth 为 true 时，Build chat 权限拒绝标 reauthRequired，默认 false。
 	MarkBuildChatDeniedAsReauth bool     `yaml:"markBuildChatDeniedAsReauth"`
 	AccountIsolatedConnections  bool     `yaml:"accountIsolatedConnections"`
@@ -617,6 +618,9 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > maxRoutingCapacityWait || c.Routing.MaxAttempts < unlimitedRoutingAttempts || c.Routing.MaxAttempts == 0 || c.Routing.MaxAttempts > maxRoutingAttempts {
 		return errors.New("routing 配置无效")
 	}
+	if c.Routing.SelectionStrategy != "balanced" && c.Routing.SelectionStrategy != "sequential" {
+		return errors.New("routing.selectionStrategy 必须是 balanced 或 sequential")
+	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
@@ -825,6 +829,7 @@ func defaultConfig() Config {
 			CooldownMax:                 Duration(30 * time.Minute),
 			CapacityWait:                Duration(500 * time.Millisecond),
 			MaxAttempts:                 999,
+			SelectionStrategy:           "balanced",
 			MarkBuildChatDeniedAsReauth: false,
 			PreferFreeBuild:             false,
 			AccountIsolatedConnections:  false,

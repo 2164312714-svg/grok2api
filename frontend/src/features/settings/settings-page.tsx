@@ -272,6 +272,16 @@ export function SettingsPage() {
                   );
                 }} />
               </SettingsField>
+              <SettingsField controlId="routing-selection-strategy" label={t("settings.routing.selectionStrategy")} description={t("settings.routing.selectionStrategyHelp")} error={form.formState.errors.routing?.selectionStrategy?.message}>
+                <Controller control={form.control} name="routing.selectionStrategy" render={({ field }) => (
+                  <Tabs value={field.value} onValueChange={field.onChange}>
+                    <TabsList id="routing-selection-strategy" className="grid w-full grid-cols-2 bg-muted/55">
+                      <TabsTrigger value="balanced">{t("settings.routing.selectionBalanced")}</TabsTrigger>
+                      <TabsTrigger value="sequential">{t("settings.routing.selectionSequential")}</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                )} />
+              </SettingsField>
               <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")} description={t("settings.routing.preferFreeBuildHelp")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-mark-build-chat-denied-as-reauth" label={t("settings.routing.markBuildChatDeniedAsReauth")} description={t("settings.routing.markBuildChatDeniedAsReauthHelp")}><Controller control={form.control} name="routing.markBuildChatDeniedAsReauth" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-mark-build-chat-denied-as-reauth" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-account-isolated-connections" label={t("settings.routing.accountIsolatedConnections")} description={t("settings.routing.accountIsolatedConnectionsHelp")}><Controller control={form.control} name="routing.accountIsolatedConnections" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-account-isolated-connections" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>

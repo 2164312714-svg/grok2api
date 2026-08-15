@@ -85,6 +85,8 @@ media:
     path: "./data/media"
 
 routing:
+  # [按需修改] balanced 均衡分散请求；sequential 优先持续使用前面的可用账号。
+  selectionStrategy: balanced
   # [按需修改] 服务端推理回放缓存：多轮时自动补回客户端未携带的 encrypted_content。
   reasoningReplayEnabled: true
   reasoningReplayTTL: 1h

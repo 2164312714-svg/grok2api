@@ -62,6 +62,25 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(quality_guard.classify_audit(short, cfg)[0], "ignored")
         self.assertEqual(quality_guard.classify_audit(failed, cfg)[0], "ignored")
 
+    def test_state_heartbeat_preserves_guard_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            original = {
+                "version": 1,
+                "nodes": {"1": {"last_reason": "within_threshold"}},
+                "passive_initialized": True,
+                "seen_audit_ids": ["audit-1"],
+                "updated_at": 1.0,
+            }
+            quality_guard.save_state(state_file, original)
+
+            quality_guard.refresh_state_heartbeat(state_file)
+
+            refreshed = quality_guard.load_state(state_file)
+            self.assertGreater(refreshed["updated_at"], 1.0)
+            self.assertEqual(refreshed["nodes"], original["nodes"])
+            self.assertEqual(refreshed["seen_audit_ids"], ["audit-1"])
+
 
 class StateTests(unittest.TestCase):
     def test_state_write_is_atomic_and_private(self):

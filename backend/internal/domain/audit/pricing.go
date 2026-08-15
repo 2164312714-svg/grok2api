@@ -8,7 +8,7 @@ import (
 
 const (
 	OfficialPricingSource             = "https://docs.x.ai/developers/pricing"
-	OfficialPricingAsOf               = "2026-07-14"
+	OfficialPricingAsOf               = "2026-08-14"
 	officialImageEditInputTicks int64 = 100_000_000
 	officialLiteImageInputTicks int64 = 20_000_000
 )
@@ -81,6 +81,7 @@ type tokenPriceRule struct {
 
 var officialTokenPriceRules = []tokenPriceRule{
 	{Pattern: regexp.MustCompile(`^grok-(?:build-0\.1|code-fast(?:-1)?|composer-2\.5-fast)(?:-[a-z0-9.]+)*$`), CanonicalModel: "grok-build-0.1"},
+	{Pattern: regexp.MustCompile(`^grok-4\.6(?:-[a-z0-9.]+)*$`), CanonicalModel: "grok-4.6"},
 	{Pattern: regexp.MustCompile(`^grok-4\.5(?:-[a-z0-9.]+)*$`), CanonicalModel: "grok-4.5"},
 	{Pattern: regexp.MustCompile(`^grok-4\.3(?:-[a-z0-9.]+)*$`), CanonicalModel: "grok-4.3"},
 	{Pattern: regexp.MustCompile(`^grok-4\.20-multi-agent(?:-[a-z0-9.]+)*$`), CanonicalModel: "grok-4.20-multi-agent-0309"},
@@ -100,6 +101,8 @@ func buildOfficialTokenPrices() map[string]tokenPrice {
 	}
 	register("grok-build-0.1", tokenPrice{InputTicks: 10000, CachedInputTicks: 2000, OutputTicks: 20000, LongContextTokens: 200000, LongInputTicks: 20000, LongCachedTicks: 4000, LongOutputTicks: 40000},
 		"grok-code-fast-1", "grok-code-fast", "grok-code-fast-1-0825", "grok-composer-2.5-fast")
+	register("grok-4.6", tokenPrice{InputTicks: 20000, CachedInputTicks: 5000, OutputTicks: 60000, LongContextTokens: 200000, LongInputTicks: 40000, LongCachedTicks: 10000, LongOutputTicks: 120000},
+		"grok-4.6-latest")
 	register("grok-4.5", tokenPrice{InputTicks: 20000, CachedInputTicks: 3000, OutputTicks: 60000, LongContextTokens: 200000, LongInputTicks: 40000, LongCachedTicks: 6000, LongOutputTicks: 120000},
 		"grok-4.5-latest", "grok-build-latest")
 	standard := tokenPrice{InputTicks: 12500, CachedInputTicks: 2000, OutputTicks: 25000, LongContextTokens: 200000, LongInputTicks: 25000, LongCachedTicks: 4000, LongOutputTicks: 50000}
@@ -303,6 +306,12 @@ func EstimateOfficialImageEditCost(model, resolution string, outputCount, inputC
 // EstimateOfficialVideoCost 按请求视频时长和分辨率计算费用。
 // 仅精确支持 grok-imagine-video 与 grok-imagine-video-1.5（可带来源前缀）；未知后缀拒绝。
 func EstimateOfficialVideoCost(model, resolution string, seconds int) (PricingResult, bool) {
+	return EstimateOfficialVideoCostWithInputs(model, resolution, seconds, 0)
+}
+
+// EstimateOfficialVideoCostWithInputs includes the official per-input-image
+// charge for video requests that use reference images.
+func EstimateOfficialVideoCostWithInputs(model, resolution string, seconds, inputImages int) (PricingResult, bool) {
 	if seconds <= 0 {
 		return PricingResult{}, false
 	}
@@ -311,18 +320,39 @@ func EstimateOfficialVideoCost(model, resolution string, seconds int) (PricingRe
 		return PricingResult{}, false
 	}
 	resolution = strings.ToLower(strings.TrimSpace(resolution))
-	var ticksPerSecond int64
+	var ticksPerSecond, ticksPerInputImage int64
 	switch resolution {
 	case "480p":
-		ticksPerSecond = 800_000_000
+		if baseModel == "grok-imagine-video" {
+			ticksPerSecond = 500_000_000
+		} else {
+			ticksPerSecond = 800_000_000
+		}
 	case "720p":
-		ticksPerSecond = 1_400_000_000
+		if baseModel == "grok-imagine-video" {
+			ticksPerSecond = 700_000_000
+		} else {
+			ticksPerSecond = 1_400_000_000
+		}
+	case "1080p":
+		if baseModel != "grok-imagine-video-1.5" {
+			return PricingResult{}, false
+		}
+		ticksPerSecond = 2_500_000_000
 	default:
 		return PricingResult{}, false
 	}
+	if inputImages < 0 {
+		inputImages = 0
+	}
+	if baseModel == "grok-imagine-video" {
+		ticksPerInputImage = 20_000_000
+	} else {
+		ticksPerInputImage = 100_000_000
+	}
 	return PricingResult{
 		Model:          baseModel + "-" + resolution,
-		CostInUSDTicks: int64(seconds) * ticksPerSecond,
+		CostInUSDTicks: int64(seconds)*ticksPerSecond + int64(inputImages)*ticksPerInputImage,
 	}, true
 }
 
@@ -349,13 +379,15 @@ func ReconstructOfficialCost(model string, inputTokens, cachedInputTokens, outpu
 	case "grok-imagine-image-edit-lite-2k":
 		return reconstructImageEditCost("grok-imagine-image", "2k", inputImages, outputImages)
 	case "grok-imagine-video-480p":
-		return reconstructVideoCost("grok-imagine-video", "480p", outputSeconds)
+		return reconstructVideoCost("grok-imagine-video", "480p", inputImages, outputSeconds)
 	case "grok-imagine-video-720p":
-		return reconstructVideoCost("grok-imagine-video", "720p", outputSeconds)
+		return reconstructVideoCost("grok-imagine-video", "720p", inputImages, outputSeconds)
+	case "grok-imagine-video-1.5-1080p":
+		return reconstructVideoCost("grok-imagine-video-1.5", "1080p", inputImages, outputSeconds)
 	case "grok-imagine-video-1.5-480p":
-		return reconstructVideoCost("grok-imagine-video-1.5", "480p", outputSeconds)
+		return reconstructVideoCost("grok-imagine-video-1.5", "480p", inputImages, outputSeconds)
 	case "grok-imagine-video-1.5-720p":
-		return reconstructVideoCost("grok-imagine-video-1.5", "720p", outputSeconds)
+		return reconstructVideoCost("grok-imagine-video-1.5", "720p", inputImages, outputSeconds)
 	default:
 		return reconstructTextCost(normalized, inputTokens, cachedInputTokens, outputTokens, contextInputTokens)
 	}
@@ -419,17 +451,27 @@ func reconstructImageEditCost(model, resolution string, inputCount, outputCount 
 	), true
 }
 
-func reconstructVideoCost(model, resolution string, seconds int64) (PricingBreakdown, bool) {
+func reconstructVideoCost(model, resolution string, inputImages, seconds int64) (PricingBreakdown, bool) {
 	if seconds <= 0 || int64(int(seconds)) != seconds {
 		return PricingBreakdown{}, false
 	}
-	result, ok := EstimateOfficialVideoCost(model, resolution, int(seconds))
+	if inputImages < 0 {
+		inputImages = 0
+	}
+	result, ok := EstimateOfficialVideoCostWithInputs(model, resolution, int(seconds), int(inputImages))
 	if !ok {
 		return PricingBreakdown{}, false
 	}
-	return newPricingBreakdown(result.Model, PricingTierMedia,
-		newPricingComponent(PricingComponentOutputSecond, PricingUnitSecond, seconds, result.CostInUSDTicks/seconds),
-	), true
+	outputResult, ok := EstimateOfficialVideoCost(model, resolution, int(seconds))
+	if !ok {
+		return PricingBreakdown{}, false
+	}
+	components := []PricingComponent{newPricingComponent(PricingComponentOutputSecond, PricingUnitSecond, seconds, outputResult.CostInUSDTicks/seconds)}
+	if inputImages > 0 {
+		inputRate := (result.CostInUSDTicks - outputResult.CostInUSDTicks) / inputImages
+		components = append(components, newPricingComponent(PricingComponentInputImage, PricingUnitImage, inputImages, inputRate))
+	}
+	return newPricingBreakdown(result.Model, PricingTierMedia, components...), true
 }
 
 func newPricingComponent(kind PricingComponentKind, unit PricingUnit, quantity, unitPriceInUSDTicks int64) PricingComponent {

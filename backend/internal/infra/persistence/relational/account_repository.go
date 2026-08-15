@@ -11,6 +11,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -423,15 +424,20 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		}
 	}
 	result := make([]account.RoutingCandidate, 0, len(values))
-	staticConsoleModel := provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != ""
+	staticCatalogModel := provider == account.ProviderConsole && strings.TrimSpace(quotaMode) != ""
+	if provider == account.ProviderWeb && strings.TrimSpace(upstreamModel) != "" {
+		staticCatalogModel, err = r.isStaticCatalogRoute(ctx, provider, modelRouteID, upstreamModel)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for _, value := range values {
 		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
-		if staticConsoleModel {
-			// Console exposes a provider-wide static catalog. Historical account
+		if staticCatalogModel {
+			// Web and Console expose provider-wide static catalogs. Historical account
 			// snapshots may predate newly shipped catalog entries, but must not
 			// make those built-in routes unroutable until every account is synced
-			// again. A non-empty quota mode proves the adapter recognizes the
-			// upstream model; unknown/manual models keep snapshot-based gating.
+			// again. Unknown/manual models keep snapshot-based gating.
 			capabilityKnown, supportsModel = true, true
 		} else if len(bound) > 0 {
 			capabilityKnown, supportsModel = true, true
@@ -671,6 +677,14 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 	if upstreamModel == "" {
 		return account.RoutingOverlaySnapshot{}, nil
 	}
+	staticCatalogModel := false
+	if provider == account.ProviderWeb {
+		var err error
+		staticCatalogModel, err = r.isStaticCatalogRoute(ctx, provider, modelRouteID, upstreamModel)
+		if err != nil {
+			return account.RoutingOverlaySnapshot{}, err
+		}
+	}
 	boundIDs, err := r.listRoutingBoundAccountIDs(ctx, provider, modelRouteID, upstreamModel)
 	if err != nil {
 		return account.RoutingOverlaySnapshot{}, err
@@ -692,6 +706,9 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 		overlay := values[state.AccountID]
 		overlay.AccountID = state.AccountID
 		overlay.ModelCapabilityKnown = true
+		if staticCatalogModel {
+			overlay.SupportsModel = true
+		}
 		values[state.AccountID] = overlay
 	}
 	var capabilities []accountModelCapabilityModel
@@ -729,6 +746,22 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 		result.Values = append(result.Values, value)
 	}
 	return result, nil
+}
+
+func (r *AccountRepository) isStaticCatalogRoute(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (bool, error) {
+	query := r.db.db.WithContext(ctx).Model(&modelRouteModel{}).
+		Where("provider = ? AND upstream_model = ? AND origin = ?", provider, upstreamModel, model.OriginCatalog)
+	if modelRouteID > 0 {
+		query = query.Where(`capability = (
+			SELECT capability FROM model_routes
+			WHERE id = ? AND provider = ? AND upstream_model = ?
+		)`, modelRouteID, provider, upstreamModel)
+	}
+	var count int64
+	if err := query.Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (r *AccountRepository) listRoutingBoundAccountIDs(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) ([]uint64, error) {
@@ -902,7 +935,16 @@ func (r *AccountRepository) ListMissingConsoleSyncBatch(ctx context.Context, aft
 
 func (r *AccountRepository) HasActive(ctx context.Context, provider account.Provider) (bool, error) {
 	var row struct{ ID uint64 }
-	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select("id").Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Take(&row).Error
+	now := time.Now().UTC()
+	err := r.db.db.WithContext(ctx).
+		Table("provider_accounts AS account").
+		Select("account.id").
+		Joins("JOIN account_credentials AS credential ON credential.account_id = account.id").
+		Where("account.provider = ? AND account.enabled = TRUE AND account.auth_status = ?", provider, account.AuthStatusActive).
+		Where("credential.encrypted_primary <> ''").
+		Where("(credential.auth_type <> ? OR credential.expires_at IS NULL OR credential.expires_at > ?)", account.AuthTypeOAuth, now).
+		Where("(account.cooldown_until IS NULL OR account.cooldown_until <= ?)", now).
+		Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}

@@ -119,6 +119,132 @@ func TestConsoleBuiltInModelIgnoresStaleAccountCapabilitySnapshot(t *testing.T) 
 	}
 }
 
+func TestWebBuiltInModelUsesOptimisticAccountCapabilities(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, Name: "web", SourceKey: "web",
+		EncryptedAccessToken: testEncryptedToken, Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-chat-fast"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.UpsertRoutes(ctx, []model.Route{{
+		PublicID: "grok-chat-heavy", Provider: account.ProviderWeb, UpstreamModel: "grok-chat-heavy",
+		Capability: model.CapabilityChat, Origin: model.OriginCatalog, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	route, err := models.GetByPublicID(ctx, "grok-chat-heavy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderWeb, route.ID, "grok-chat-heavy", "heavy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || !candidates[0].SupportsModel {
+		t.Fatalf("built-in Web model must survive an incomplete account snapshot: %#v", candidates)
+	}
+	overlay, err := accounts.ListRoutingAccountOverlays(ctx, account.ProviderWeb, route.ID, route.UpstreamModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overlay.Values) != 1 || !overlay.Values[0].ModelCapabilityKnown || !overlay.Values[0].SupportsModel {
+		t.Fatalf("layered Web model overlay must use optimistic support: %#v", overlay)
+	}
+	mismatched, err := models.Create(ctx, model.Route{
+		PublicID: "mismatched-web-model", Provider: account.ProviderWeb, UpstreamModel: route.UpstreamModel,
+		Capability: model.CapabilityImage, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = accounts.ListRoutingCandidates(ctx, account.ProviderWeb, mismatched.ID, mismatched.UpstreamModel, "heavy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || candidates[0].SupportsModel {
+		t.Fatalf("mismatched Web alias must retain capability gating: %#v", candidates)
+	}
+
+	unknown, err := models.Create(ctx, model.Route{
+		PublicID: "unknown-web-model", Provider: account.ProviderWeb, UpstreamModel: "unknown-web-model",
+		Capability: model.CapabilityChat, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = accounts.ListRoutingCandidates(ctx, account.ProviderWeb, unknown.ID, unknown.UpstreamModel, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || !candidates[0].ModelCapabilityKnown || candidates[0].SupportsModel {
+		t.Fatalf("unknown Web model must retain capability gating: %#v", candidates)
+	}
+}
+
+func TestWebCatalogRoutesAdvertiseAllActiveAutomaticAccounts(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+
+	createAccount := func(name string) account.Credential {
+		t.Helper()
+		value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, Name: name, SourceKey: name,
+			EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	first := createAccount("web-first")
+	second := createAccount("web-second")
+	if err := models.ReplaceAccountCapabilities(ctx, first.ID, []string{"grok-chat-fast"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, second.ID, []string{"grok-chat-fast"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	const publicID = "grok-chat-heavy"
+	if err := models.UpsertRoutes(ctx, []model.Route{{
+		PublicID: publicID, Provider: account.ProviderWeb, UpstreamModel: publicID,
+		Capability: model.CapabilityChat, Origin: model.OriginCatalog, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, total, err := models.List(ctx, repository.ModelListQuery{Page: repository.PageQuery{Limit: 20}})
+	if err != nil || total != 1 || len(routes) != 1 {
+		t.Fatalf("Web route list = %#v, total=%d, err=%v", routes, total, err)
+	}
+	if route := routes[0]; route.SupportedAccounts != 2 || route.TotalAccounts != 2 || route.SyncedAccounts != 2 || len(route.BoundAccountIDs) != 0 {
+		t.Fatalf("automatic Web account pool = %#v", route)
+	}
+
+	unknown, err := models.Create(ctx, model.Route{
+		PublicID: "legacy-unknown-web", Provider: account.ProviderWeb, UpstreamModel: "unknown-web-model",
+		Capability: model.CapabilityChat, Enabled: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.SupportedAccounts != 0 || unknown.TotalAccounts != 2 {
+		t.Fatalf("unknown Web route must not inherit static catalog support: %#v", unknown)
+	}
+}
+
 func TestConsoleCatalogRoutesUseAutomaticAccountPoolWithoutCapabilitySnapshot(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)

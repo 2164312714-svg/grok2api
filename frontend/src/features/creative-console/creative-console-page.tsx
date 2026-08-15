@@ -81,7 +81,7 @@ type ChatSession = {
 const imageAspectRatios = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] as const;
 const videoAspectRatios = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] as const;
 const imageResolutions = ["1k", "2k"] as const;
-const videoResolutions = ["480p", "720p", "1080p"] as const;
+const videoResolutions = ["480p", "720p"] as const;
 const videoDurations = ["6", "10", "15"] as const;
 const chatHistoryStoragePrefix = "grok2api:creative-console:chat-history:";
 const chatHistoryMaxSessions = 50;
@@ -123,12 +123,12 @@ export function CreativeConsolePage() {
   const modelGroups = useMemo(() => ({
     chat: uniqueModelsByPublicID(permittedModels.filter((model) => model.capability === "chat" || model.capability === "responses")),
     image: uniqueModelsByPublicID(permittedModels.filter((model) => model.capability === "image")),
-    video: uniqueModelsByPublicID(permittedModels.filter((model) => model.capability === "video")),
+    video: preferredConsoleVideoModels(permittedModels.filter((model) => model.capability === "video")),
   }), [permittedModels]);
   const effectiveModels = useMemo<Record<CreativeMode, string>>(() => ({
     chat: modelGroups.chat.some((model) => model.publicId === selectedModels.chat) ? selectedModels.chat : modelGroups.chat[0]?.publicId ?? "",
     image: modelGroups.image.some((model) => model.publicId === selectedModels.image) ? selectedModels.image : modelGroups.image[0]?.publicId ?? "",
-    video: modelGroups.video.some((model) => model.publicId === selectedModels.video) ? selectedModels.video : modelGroups.video[0]?.publicId ?? "",
+    video: modelGroups.video.some((model) => videoModelRequestID(model) === selectedModels.video) ? selectedModels.video : modelGroups.video[0] ? videoModelRequestID(modelGroups.video[0]) : "",
   }), [modelGroups, selectedModels]);
 
   const secretMutation = useMutation({
@@ -989,7 +989,7 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
           <Textarea id="video-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("creativeConsole.videoPlaceholder")} className="min-h-24 resize-none border-0 bg-transparent px-4 py-3 text-sm focus-visible:ring-0" />
           <div className="flex items-center justify-between gap-3 px-3 pb-3">
             <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
-              <CompactModelSelect value={model} models={modelOptions} onChange={onModelChange} />
+              <CompactModelSelect value={model} models={modelOptions} onChange={onModelChange} qualified />
               <Popover>
                 <PopoverTrigger asChild>
                   <Button type="button" variant="ghost" size="sm" className={cn("h-8 gap-1.5 px-2 font-normal", (imageURL || imageFileID) && "bg-secondary/70 text-foreground")} aria-label={t("creativeConsole.referenceImage")}>
@@ -1079,14 +1079,17 @@ function WelcomeState({ title }: { title: string }) {
   );
 }
 
-function CompactModelSelect({ value, models, onChange }: { value: string; models: ModelRouteDTO[]; onChange: (model: string) => void }) {
+function CompactModelSelect({ value, models, onChange, qualified = false }: { value: string; models: ModelRouteDTO[]; onChange: (model: string) => void; qualified?: boolean }) {
   const { t } = useTranslation();
   return (
     <Select value={value} onValueChange={onChange} disabled={models.length === 0}>
       <SelectTrigger className="h-8 w-auto max-w-56 gap-1 border-0 bg-transparent px-2 shadow-none hover:bg-secondary/70 focus:bg-secondary/70 focus:ring-0" aria-label={t("creativeConsole.model")}>
         <SelectValue placeholder={models.length === 0 ? t("creativeConsole.noModels") : t("creativeConsole.selectModel")} />
       </SelectTrigger>
-      <SelectContent>{models.map((item) => <SelectItem key={item.id} value={item.publicId}>{item.publicId}</SelectItem>)}</SelectContent>
+      <SelectContent>{models.map((item) => {
+        const optionValue = qualified ? videoModelRequestID(item) : item.publicId;
+        return <SelectItem key={item.id} value={optionValue}>{optionValue}</SelectItem>;
+      })}</SelectContent>
     </Select>
   );
 }
@@ -1332,6 +1335,17 @@ function uniqueModelsByPublicID(models: ModelRouteDTO[]): ModelRouteDTO[] {
     seen.add(model.publicId);
     return true;
   });
+}
+
+function preferredConsoleVideoModels(models: ModelRouteDTO[]): ModelRouteDTO[] {
+  const consoleModels = models.filter((model) => model.provider === "grok_console");
+  return uniqueModelsByPublicID(consoleModels.length > 0 ? consoleModels : models);
+}
+
+function videoModelRequestID(model: ModelRouteDTO): string {
+  const namespace = model.provider === "grok_console" ? "Console" : model.provider === "grok_web" ? "Web" : "Build";
+  const localID = model.publicId.includes("/") ? model.publicId.slice(model.publicId.indexOf("/") + 1) : model.publicId;
+  return `${namespace}/${localID}`;
 }
 
 function isFixedReasoningConsoleModel(model: ModelRouteDTO | undefined): boolean {

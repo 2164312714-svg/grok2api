@@ -102,6 +102,7 @@ type routingConfigDTO struct {
 	CooldownMax                 string                      `json:"cooldownMax"`
 	CapacityWait                string                      `json:"capacityWait"`
 	MaxAttempts                 int                         `json:"maxAttempts"`
+	SelectionStrategy           *string                     `json:"selectionStrategy,omitempty"`
 	PreferFreeBuild             bool                        `json:"preferFreeBuild"`
 	MarkBuildChatDeniedAsReauth *bool                       `json:"markBuildChatDeniedAsReauth,omitempty"`
 	AccountIsolatedConnections  *bool                       `json:"accountIsolatedConnections,omitempty"`
@@ -225,6 +226,8 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			StickyTTL: value.Routing.StickyTTL, CooldownBase: value.Routing.CooldownBase,
 			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts,
 			PreferFreeBuild:                     value.Routing.PreferFreeBuild,
+			SelectionStrategy:                   optionalString(value.Routing.SelectionStrategy),
+			SelectionStrategyProvided:           value.Routing.SelectionStrategy != nil,
 			MarkBuildChatDeniedAsReauth:         boolValue(value.Routing.MarkBuildChatDeniedAsReauth),
 			MarkBuildChatDeniedAsReauthProvided: value.Routing.MarkBuildChatDeniedAsReauth != nil,
 			AccountIsolatedConnections:          boolValue(value.Routing.AccountIsolatedConnections),
@@ -307,6 +310,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				StickyTTL: config.Routing.StickyTTL, CooldownBase: config.Routing.CooldownBase,
 				CooldownMax: config.Routing.CooldownMax, CapacityWait: config.Routing.CapacityWait, MaxAttempts: config.Routing.MaxAttempts,
 				MarkBuildChatDeniedAsReauth: boolPointer(config.Routing.MarkBuildChatDeniedAsReauth),
+				SelectionStrategy:           stringPointer(config.Routing.SelectionStrategy),
 				PreferFreeBuild:             config.Routing.PreferFreeBuild,
 				AccountIsolatedConnections:  boolPointer(config.Routing.AccountIsolatedConnections),
 				SegmentedSelector: &segmentedSelectorConfigDTO{

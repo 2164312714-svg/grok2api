@@ -14,6 +14,7 @@ type segmentedSelectorActiveRequest struct {
 	provider   account.Provider
 	windowSize int
 	cursor     uint64
+	strategy   selectionStrategy
 }
 
 type segmentedSelectorCohortBucket struct {
@@ -32,13 +33,18 @@ const segmentedWindowsBeforeFullFallback = 4
 func (s *Selector) nextSegmentedActiveRequest(provider account.Provider, upstreamModel, quotaMode string, candidateCount int) *segmentedSelectorActiveRequest {
 	s.configMu.RLock()
 	config := s.segmentedConfig
+	strategy := s.selectionStrategy
 	s.configMu.RUnlock()
 	if !config.enabled || candidateCount < config.minCandidates {
 		return nil
 	}
-	shard := segmentedSelectorShard(provider, upstreamModel, quotaMode)
-	cursor := s.segmentedState.activeCursors[shard].Add(uint64(config.windowSize)) - uint64(config.windowSize)
-	return &segmentedSelectorActiveRequest{provider: provider, windowSize: config.windowSize, cursor: cursor}
+	cursor := uint64(0)
+	if strategy != selectionStrategySequential {
+		strategy = selectionStrategyBalanced
+		shard := segmentedSelectorShard(provider, upstreamModel, quotaMode)
+		cursor = s.segmentedState.activeCursors[shard].Add(uint64(config.windowSize)) - uint64(config.windowSize)
+	}
+	return &segmentedSelectorActiveRequest{provider: provider, windowSize: config.windowSize, cursor: cursor, strategy: strategy}
 }
 
 func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []account.RoutingCandidate, indexes []int, quotaMode string, tierOrder []account.WebTier, request segmentedSelectorActiveRequest) (*accountLease, error) {
@@ -77,7 +83,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 			}
 		} else {
 			concurrencyHints := make([]int, len(values))
-			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild)
+			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild, request.strategy)
 			roundWindows := 0
 			fallbackToFull := false
 			for cohortIndex, bucket := range cohorts {
@@ -177,7 +183,7 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 	return result, nil
 }
 
-func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool) []segmentedSelectorCohortBucket {
+func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool, strategy selectionStrategy) []segmentedSelectorCohortBucket {
 	buckets := make(map[segmentedSelectorCohort][]int)
 	appendCandidate := func(index int) {
 		candidate := values[index]
@@ -185,6 +191,10 @@ func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int,
 			supportsModel: candidate.SupportsModel, capabilityKnown: candidate.ModelCapabilityKnown,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
 			tier:            tierOrderRank(tierOrder, candidate.Credential.WebTier), priority: candidate.Credential.Priority,
+		}
+		if candidate.QuotaWindow != nil && candidate.QuotaWindow.Source == account.QuotaSourceUpstream {
+			cohort.quotaKnown = true
+			cohort.quotaAvailable = candidate.QuotaWindow.Remaining > 0
 		}
 		if candidate.Billing != nil {
 			cohort.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
@@ -202,6 +212,11 @@ func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int,
 	}
 	result := make([]segmentedSelectorCohortBucket, 0, len(buckets))
 	for cohort, cohortIndexes := range buckets {
+		if strategy == selectionStrategySequential {
+			sort.Slice(cohortIndexes, func(left, right int) bool {
+				return values[cohortIndexes[left]].Credential.ID < values[cohortIndexes[right]].Credential.ID
+			})
+		}
 		result = append(result, segmentedSelectorCohortBucket{cohort: cohort, indexes: cohortIndexes})
 	}
 	sort.Slice(result, func(left, right int) bool {

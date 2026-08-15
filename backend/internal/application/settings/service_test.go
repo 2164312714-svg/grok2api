@@ -49,6 +49,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	input.Server.MaxConcurrentRequests = 2048
 	input.ProviderBuild.ResponseHeaderTimeout = "7m"
 	input.Routing.MaxAttempts = 5
+	input.Routing.SelectionStrategy = "sequential"
 	input.Routing.PreferFreeBuild = true
 	input.Routing.SegmentedSelector = SegmentedSelectorConfig{Enabled: true, MinCandidates: 5000, WindowSize: 96}
 	input.Audit.BufferSize = cfg.Audit.BufferSize + 1
@@ -64,7 +65,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if applied.Routing.MaxAttempts != 5 || !applied.Routing.PreferFreeBuild || !applied.Routing.SegmentedSelectorEnabled || applied.Routing.SegmentedMinCandidates != 5000 || applied.Routing.SegmentedWindowSize != 96 {
+	if applied.Routing.MaxAttempts != 5 || applied.Routing.SelectionStrategy != "sequential" || !applied.Routing.PreferFreeBuild || !applied.Routing.SegmentedSelectorEnabled || applied.Routing.SegmentedMinCandidates != 5000 || applied.Routing.SegmentedWindowSize != 96 {
 		t.Fatalf("runtime configuration was not applied: %#v", applied.Routing)
 	}
 	if applied.Server.MaxConcurrentRequests != 2048 {
@@ -92,7 +93,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || reloaded.Routing.SelectionStrategy != "sequential" || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
 		t.Fatalf("configuration was not persisted")
 	}
 }
@@ -248,6 +249,26 @@ func TestLoadPersistedKeepsAccountIsolationDefaultForOlderPayload(t *testing.T) 
 	}
 	if !loaded.Routing.AccountIsolatedConnections {
 		t.Fatal("older persisted payload disabled config.yaml account isolation")
+	}
+}
+
+func TestSelectionStrategyCompatibilityAndValidation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Routing.SelectionStrategy = "sequential"
+	value := toDomainConfig(cfg)
+	value.Routing.SelectionStrategy = nil
+	loaded := applyDomainConfig(cfg, value)
+	if loaded.Routing.SelectionStrategy != "sequential" {
+		t.Fatalf("legacy payload changed strategy to %q", loaded.Routing.SelectionStrategy)
+	}
+
+	repository := &runtimeSettingsRepositoryStub{}
+	service := NewService(cfg, time.Time{}, 0, repository, nil, nil)
+	input := service.Get().Config
+	input.Routing.SelectionStrategy = "random"
+	input.Routing.SelectionStrategyProvided = true
+	if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid strategy error = %v", err)
 	}
 }
 

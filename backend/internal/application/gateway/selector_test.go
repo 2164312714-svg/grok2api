@@ -975,6 +975,76 @@ func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 	}
 }
 
+func TestSequentialSelectionKeepsUsingFirstAvailableAccount(t *testing.T) {
+	selector := newSegmentedActiveTestSelector(3, memory.NewConcurrencyLimiter(), nil)
+	selector.UpdateSelectionStrategy("sequential")
+
+	for attempt := range 3 {
+		lease, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Credential.ID != 1 {
+			lease.Release()
+			t.Fatalf("selection %d = %d, want account 1", attempt, lease.Credential.ID)
+		}
+		lease.Release()
+	}
+}
+
+func TestBalancedSelectionStillRotatesAccounts(t *testing.T) {
+	selector := newSegmentedActiveTestSelector(3, memory.NewConcurrencyLimiter(), nil)
+	wanted := []uint64{1, 2, 3}
+	for attempt, expected := range wanted {
+		lease, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Credential.ID != expected {
+			lease.Release()
+			t.Fatalf("selection %d = %d, want %d", attempt, lease.Credential.ID, expected)
+		}
+		lease.Release()
+	}
+}
+
+func TestSequentialSelectionExpandsAtCapacityAndReturnsAfterRelease(t *testing.T) {
+	selector := newSegmentedActiveTestSelector(2, memory.NewConcurrencyLimiter(), nil)
+	selector.UpdateSelectionStrategy("sequential")
+	leasing := make([]*accountLease, 0, account.DefaultMaxConcurrent)
+	for range account.DefaultMaxConcurrent {
+		lease, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Credential.ID != 1 {
+			t.Fatalf("account 1 capacity filled with account %d", lease.Credential.ID)
+		}
+		leasing = append(leasing, lease)
+	}
+	fallback, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Credential.ID != 2 {
+		t.Fatalf("saturated account 1 fell back to %d, want 2", fallback.Credential.ID)
+	}
+
+	leasing[0].Release()
+	reused, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.Credential.ID != 1 {
+		t.Fatalf("released capacity selected account %d, want account 1", reused.Credential.ID)
+	}
+	reused.Release()
+	fallback.Release()
+	for _, lease := range leasing[1:] {
+		lease.Release()
+	}
+}
+
 func TestCandidatePlanPrefersKnownRemainingQuota(t *testing.T) {
 	values := []account.RoutingCandidate{
 		{Credential: account.Credential{ID: 1, Priority: 100}},

@@ -19,6 +19,7 @@ import signal
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -38,6 +39,9 @@ RUNTIME_CONFIG_FIELDS = {
     "quarantine_seconds",
     "min_healthy_nodes",
 }
+
+STATE_FILE_LOCK = threading.Lock()
+STATE_HEARTBEAT_INTERVAL_SECONDS = 15.0
 
 
 BOOTSTRAP_VERSION = 1
@@ -471,7 +475,7 @@ def load_state(path: Path) -> dict[str, Any]:
     return value
 
 
-def save_state(path: Path, state: dict[str, Any]) -> None:
+def _write_state_unlocked(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=".state-", dir=path.parent)
     try:
@@ -488,6 +492,26 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    with STATE_FILE_LOCK:
+        _write_state_unlocked(path, state)
+
+
+def refresh_state_heartbeat(path: Path) -> None:
+    with STATE_FILE_LOCK:
+        state = load_state(path)
+        state["updated_at"] = time.time()
+        _write_state_unlocked(path, state)
+
+
+def run_state_heartbeat(path: Path, stop_event: threading.Event, interval_seconds: float) -> None:
+    while not stop_event.wait(interval_seconds):
+        try:
+            refresh_state_heartbeat(path)
+        except Exception as exc:
+            log_event("state_heartbeat_failed", error_type=type(exc).__name__)
 
 
 def append_state_event(state: dict[str, Any], event: str, **fields: Any) -> None:
@@ -1067,6 +1091,14 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, stop)
     api = ApiClient(config)
     guard = Guard(config, api)
+    heartbeat_stop = threading.Event()
+    heartbeat = threading.Thread(
+        target=run_state_heartbeat,
+        args=(config.state_file, heartbeat_stop, STATE_HEARTBEAT_INTERVAL_SECONDS),
+        name="quality-guard-state-heartbeat",
+        daemon=True,
+    )
+    heartbeat.start()
     last_active_at = float(guard.state.get("last_active_cycle_at", 0.0))
     active_delay = max(0.0, last_active_at + config.active_interval_seconds - time.time())
     next_active = 0.0 if args.once else time.monotonic() + active_delay
@@ -1118,6 +1150,8 @@ def main(argv: list[str] | None = None) -> int:
             deadlines.append(next_active)
         delay = max(0.1, min(deadlines) - time.monotonic()) if deadlines else 1.0
         time.sleep(min(1.0, delay))
+    heartbeat_stop.set()
+    heartbeat.join(timeout=2.0)
     log_event("guard_stopped")
     return 0
 

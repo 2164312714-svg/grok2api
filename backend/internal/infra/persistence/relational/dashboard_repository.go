@@ -34,6 +34,14 @@ const dashboardUsageAggregateSelect = `
 
 const dashboardTopModelsLimit = 10
 
+const dashboardBucketAggregateSelect = `COUNT(request_audits.id) AS requests,
+	COALESCE(SUM(request_audits.input_tokens), 0) AS input_tokens,
+	COALESCE(SUM(request_audits.cached_input_tokens), 0) AS cached_input_tokens,
+	COALESCE(SUM(request_audits.output_tokens), 0) AS output_tokens,
+	COALESCE(SUM(request_audits.reasoning_tokens), 0) AS reasoning_tokens,
+	COALESCE(SUM(request_audits.total_tokens), 0) AS tokens,
+	COALESCE(SUM(CASE WHEN request_audits.cost_in_usd_ticks > 0 THEN request_audits.cost_in_usd_ticks ELSE request_audits.estimated_cost_in_usd_ticks END), 0) AS billed_cost_usd_ticks`
+
 // Snapshot 在同一数据库事务内读取资源计数和指定区间的审计聚合。
 func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.DashboardSnapshotWindow, snapshotAt time.Time) (dashboarddomain.Aggregate, error) {
 	if err := validateDashboardBoundaries(window.BucketBoundaries); err != nil {
@@ -45,10 +53,8 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 	bucketBoundaries := window.BucketBoundaries
 	start := bucketBoundaries[0]
 	end := bucketBoundaries[len(bucketBoundaries)-1]
-	bucketExpression, bucketArgs := dashboardBucketExpression(bucketBoundaries)
-	activityExpression, activityArgs := dashboardBucketExpression(window.ActivityBoundaries)
 	result := dashboarddomain.Aggregate{}
-	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	load := func(tx *gorm.DB) error {
 		var accounts struct {
 			Total           int64
 			Active          int64
@@ -109,13 +115,21 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			Tokens             int64
 			BilledCostUSDTicks int64
 		}
-		if err := tx.Model(&requestAuditModel{}).
-			Select(bucketExpression+" AS bucket_index, COUNT(*) AS requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(CASE WHEN cost_in_usd_ticks > 0 THEN cost_in_usd_ticks ELSE estimated_cost_in_usd_ticks END), 0) AS billed_cost_usd_ticks", bucketArgs...).
-			Where("created_at >= ? AND created_at < ?", start, end).
-			Group("bucket_index").
-			Order("bucket_index ASC").
-			Scan(&buckets).Error; err != nil {
-			return err
+		var bucketErr error
+		if r.db.dialect == "sqlite" {
+			query, args := dashboardSQLiteBucketQuery(bucketBoundaries, dashboardBucketAggregateSelect)
+			bucketErr = tx.Raw(query, args...).Scan(&buckets).Error
+		} else {
+			bucketExpression, bucketArgs := dashboardPostgresBucketExpression(bucketBoundaries)
+			bucketErr = tx.Model(&requestAuditModel{}).
+				Select(bucketExpression+" AS bucket_index, COUNT(*) AS requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(CASE WHEN cost_in_usd_ticks > 0 THEN cost_in_usd_ticks ELSE estimated_cost_in_usd_ticks END), 0) AS billed_cost_usd_ticks", bucketArgs...).
+				Where("created_at >= ? AND created_at < ?", start, end).
+				Group("bucket_index").
+				Order("bucket_index ASC").
+				Scan(&buckets).Error
+		}
+		if bucketErr != nil {
+			return bucketErr
 		}
 		result.Buckets = make([]dashboarddomain.Bucket, 0, len(buckets))
 		for _, bucket := range buckets {
@@ -126,13 +140,21 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			BucketIndex int `gorm:"column:bucket_index"`
 			Requests    int64
 		}
-		if err := tx.Model(&requestAuditModel{}).
-			Select(activityExpression+" AS bucket_index, COUNT(*) AS requests", activityArgs...).
-			Where("created_at >= ? AND created_at < ?", window.ActivityBoundaries[0], window.ActivityBoundaries[len(window.ActivityBoundaries)-1]).
-			Group("bucket_index").
-			Order("bucket_index ASC").
-			Scan(&activityBuckets).Error; err != nil {
-			return err
+		var activityErr error
+		if r.db.dialect == "sqlite" {
+			query, args := dashboardSQLiteBucketQuery(window.ActivityBoundaries, "COUNT(request_audits.id) AS requests")
+			activityErr = tx.Raw(query, args...).Scan(&activityBuckets).Error
+		} else {
+			activityExpression, activityArgs := dashboardPostgresBucketExpression(window.ActivityBoundaries)
+			activityErr = tx.Model(&requestAuditModel{}).
+				Select(activityExpression+" AS bucket_index, COUNT(*) AS requests", activityArgs...).
+				Where("created_at >= ? AND created_at < ?", window.ActivityBoundaries[0], window.ActivityBoundaries[len(window.ActivityBoundaries)-1]).
+				Group("bucket_index").
+				Order("bucket_index ASC").
+				Scan(&activityBuckets).Error
+		}
+		if activityErr != nil {
+			return activityErr
 		}
 		result.ActivityBuckets = make([]dashboarddomain.ActivityBucket, 0, len(activityBuckets))
 		for _, bucket := range activityBuckets {
@@ -213,8 +235,25 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			}
 		}
 		return nil
-	})
+	}
+	err := r.withSnapshot(ctx, load)
 	return result, err
+}
+
+func (r *DashboardRepository) withSnapshot(ctx context.Context, load func(*gorm.DB) error) error {
+	if r.db.dialect == "sqlite" {
+		return r.db.db.WithContext(ctx).Connection(func(tx *gorm.DB) error {
+			if beginErr := tx.Exec("BEGIN DEFERRED").Error; beginErr != nil {
+				return beginErr
+			}
+			defer func() { _ = tx.Exec("ROLLBACK").Error }()
+			if loadErr := load(tx.Session(&gorm.Session{NewDB: true})); loadErr != nil {
+				return loadErr
+			}
+			return tx.Exec("COMMIT").Error
+		})
+	}
+	return r.db.db.WithContext(ctx).Transaction(load)
 }
 
 func validateDashboardBoundaries(boundaries []time.Time) error {
@@ -229,14 +268,34 @@ func validateDashboardBoundaries(boundaries []time.Time) error {
 	return nil
 }
 
-func dashboardBucketExpression(boundaries []time.Time) (string, []any) {
+func dashboardPostgresBucketExpression(boundaries []time.Time) (string, []any) {
 	var expression strings.Builder
-	expression.WriteString("CASE")
-	args := make([]any, 0)
-	for index := 0; index < len(boundaries)-1; index++ {
-		expression.WriteString(" WHEN created_at >= ? AND created_at < ? THEN ?")
-		args = append(args, boundaries[index], boundaries[index+1], index)
+	expression.WriteString("width_bucket(created_at, ARRAY[")
+	args := make([]any, 0, len(boundaries))
+	for index, boundary := range boundaries {
+		if index > 0 {
+			expression.WriteString(", ")
+		}
+		expression.WriteString("?::timestamptz")
+		args = append(args, boundary)
 	}
-	expression.WriteString(" ELSE -1 END")
+	expression.WriteString("]) - 1")
 	return expression.String(), args
+}
+
+func dashboardSQLiteBucketQuery(boundaries []time.Time, aggregateSelect string) (string, []any) {
+	var query strings.Builder
+	query.WriteString("WITH dashboard_buckets(bucket_index, start_at, end_at) AS (VALUES ")
+	args := make([]any, 0, (len(boundaries)-1)*3)
+	for index := 0; index < len(boundaries)-1; index++ {
+		if index > 0 {
+			query.WriteString(",")
+		}
+		query.WriteString("(?, ?, ?)")
+		args = append(args, index, boundaries[index], boundaries[index+1])
+	}
+	query.WriteString(") SELECT dashboard_buckets.bucket_index AS bucket_index, ")
+	query.WriteString(aggregateSelect)
+	query.WriteString(" FROM dashboard_buckets JOIN request_audits ON request_audits.created_at >= dashboard_buckets.start_at AND request_audits.created_at < dashboard_buckets.end_at GROUP BY dashboard_buckets.bucket_index ORDER BY dashboard_buckets.bucket_index ASC")
+	return query.String(), args
 }

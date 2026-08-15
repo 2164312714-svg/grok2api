@@ -23,29 +23,29 @@ type ModelRepository struct {
 	observer repository.InvalidationObserver
 }
 
-// Console static support is anchored to the reconciled catalog routes instead
-// of the provider name alone. Manual aliases remain supported while an
+// Web and Console static support is anchored to the reconciled catalog routes
+// instead of the provider name alone. Manual aliases remain supported while an
 // equivalent catalog route exists, and stale aliases stop advertising support
 // as soon as that catalog entry is removed.
-const modelConsoleStaticSupportExpression = `(model_routes.provider = 'grok_console' AND (
+const modelStaticCatalogSupportExpression = `(model_routes.provider IN ('grok_web', 'grok_console') AND (
 	model_routes.origin = 'catalog'
 	OR EXISTS (
-		SELECT 1 FROM model_routes console_catalog_route
-		WHERE console_catalog_route.provider = model_routes.provider
-			AND console_catalog_route.upstream_model = model_routes.upstream_model
-			AND console_catalog_route.capability = model_routes.capability
-			AND console_catalog_route.origin = 'catalog'
+		SELECT 1 FROM model_routes catalog_route
+		WHERE catalog_route.provider = model_routes.provider
+			AND catalog_route.upstream_model = model_routes.upstream_model
+			AND catalog_route.capability = model_routes.capability
+			AND catalog_route.origin = 'catalog'
 	)
 ))`
 
-const modelConsoleStaticSupportAvailabilityExpression = `(route.provider = 'grok_console' AND (
+const modelStaticCatalogSupportAvailabilityExpression = `(route.provider IN ('grok_web', 'grok_console') AND (
 	route.origin = 'catalog'
 	OR EXISTS (
-		SELECT 1 FROM model_routes console_catalog_route
-		WHERE console_catalog_route.provider = route.provider
-			AND console_catalog_route.upstream_model = route.upstream_model
-			AND console_catalog_route.capability = route.capability
-			AND console_catalog_route.origin = 'catalog'
+		SELECT 1 FROM model_routes catalog_route
+		WHERE catalog_route.provider = route.provider
+			AND catalog_route.upstream_model = route.upstream_model
+			AND catalog_route.capability = route.capability
+			AND catalog_route.origin = 'catalog'
 	)
 ))`
 
@@ -64,7 +64,7 @@ const availableRoutePredicate = `
 				OR (
 					NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 					AND (
-						` + modelConsoleStaticSupportExpression + `
+						` + modelStaticCatalogSupportExpression + `
 						OR EXISTS (
 							SELECT 1 FROM account_model_capabilities capability
 							WHERE capability.account_id = account.id
@@ -142,7 +142,7 @@ const modelRouteAccountCapabilityPredicate = `(
 	OR (
 		NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 		AND (
-			` + modelConsoleStaticSupportExpression + `
+			` + modelStaticCatalogSupportExpression + `
 			OR EXISTS (
 				SELECT 1 FROM account_model_capabilities capability
 				WHERE capability.account_id = account.id
@@ -162,7 +162,7 @@ const modelAvailableRouteAccountCapabilityPredicate = `(
 	OR (
 		NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id)
 		AND (
-			` + modelConsoleStaticSupportExpression + `
+			` + modelStaticCatalogSupportExpression + `
 			OR EXISTS (
 				SELECT 1 FROM account_model_capabilities capability
 				WHERE capability.account_id = account.id
@@ -207,7 +207,7 @@ func modelTierAvailabilityPredicateWithAvailability(tiers []string, activeOnly b
 
 const (
 	modelProviderPriorityExpression = "CASE model_routes.provider WHEN 'grok_build' THEN 0 WHEN 'grok_web' THEN 1 WHEN 'grok_console' THEN 2 ELSE 3 END"
-	modelSupportSortExpression      = `(SELECT COUNT(*) FROM provider_accounts account WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active' AND (EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id AND binding.account_id = account.id) OR (NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id) AND (` + modelConsoleStaticSupportExpression + ` OR EXISTS (SELECT 1 FROM account_model_capabilities capability WHERE capability.account_id = account.id AND capability.upstream_model = model_routes.upstream_model) OR ` + modelSharedPaidBuildSupportSortExpression + `))))`
+	modelSupportSortExpression      = `(SELECT COUNT(*) FROM provider_accounts account WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active' AND (EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id AND binding.account_id = account.id) OR (NOT EXISTS (SELECT 1 FROM model_route_accounts binding WHERE binding.model_route_id = model_routes.id) AND (` + modelStaticCatalogSupportExpression + ` OR EXISTS (SELECT 1 FROM account_model_capabilities capability WHERE capability.account_id = account.id AND capability.upstream_model = model_routes.upstream_model) OR ` + modelSharedPaidBuildSupportSortExpression + `))))`
 	modelSyncedSortExpression       = `(SELECT MAX(sync.last_success_at) FROM provider_accounts account JOIN account_model_sync_states sync ON sync.account_id = account.id WHERE account.provider = model_routes.provider AND account.enabled = TRUE AND account.auth_status = 'active')`
 )
 
@@ -484,17 +484,15 @@ func (r *ModelRepository) ListEnabledForScope(ctx context.Context, filter reposi
 	return values, nil
 }
 
-// ListConfiguredEnabled 返回所有已启用配置，包括暂时没有可用账号的路由，供 readiness 展示部分故障。
+// ListConfiguredEnabled 返回所有已启用配置，包括暂时没有可用账号的路由。
+// 可用账号由 readiness 的 provider-level 索引查询判断；这里不扫描全量
+// 账号能力表，避免健康探针放大数据库负载。
 func (r *ModelRepository) ListConfiguredEnabled(ctx context.Context) ([]model.Route, error) {
 	var rows []modelRouteModel
 	if err := r.db.db.WithContext(ctx).Where("enabled = ?", true).Order("public_id ASC, id ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	values := mapModelRows(rows)
-	if err := r.annotateAvailability(ctx, values); err != nil {
-		return nil, err
-	}
-	return values, nil
+	return mapModelRows(rows), nil
 }
 
 func (r *ModelRepository) Get(ctx context.Context, id uint64) (model.Route, error) {
@@ -1137,15 +1135,76 @@ func (r *ModelRepository) annotateAvailability(ctx context.Context, values []mod
 		LastSyncedUnix    sql.NullInt64
 	}
 	var rows []availabilityRow
-	lastSyncedExpression := "MAX(unixepoch(sync.last_success_at))"
 	if r.db.dialect == "postgres" {
-		lastSyncedExpression = "CAST(MAX(EXTRACT(EPOCH FROM sync.last_success_at)) AS BIGINT)"
-	}
-	err := r.db.db.WithContext(ctx).Raw(fmt.Sprintf(`
+		err := r.db.db.WithContext(ctx).Raw(`
+			WITH active_accounts AS MATERIALIZED (
+				SELECT account.id,
+					account.provider,
+					(account.provider = 'grok_build' AND `+modelAccountBuildSuperPredicate+`) AS is_build_super,
+					sync.last_success_at
+				FROM provider_accounts account
+				LEFT JOIN account_model_sync_states sync ON sync.account_id = account.id
+				WHERE account.enabled = TRUE AND account.auth_status = ?
+			),
+			provider_stats AS (
+				SELECT provider,
+					COUNT(*) AS total_accounts,
+					COUNT(*) FILTER (WHERE last_success_at IS NOT NULL) AS synced_accounts,
+					COUNT(*) FILTER (WHERE is_build_super) AS build_super_accounts
+				FROM active_accounts
+				GROUP BY provider
+			),
+			provider_last_sync AS (
+				SELECT account.provider, MAX(sync.last_success_at) AS last_success_at
+				FROM provider_accounts account
+				JOIN account_model_sync_states sync ON sync.account_id = account.id
+				GROUP BY account.provider
+			),
+			binding_stats AS (
+				SELECT binding.model_route_id,
+					COUNT(*) AS total_accounts,
+					COUNT(active.id) AS supported_accounts,
+					COUNT(active.id) FILTER (WHERE active.last_success_at IS NOT NULL) AS synced_accounts
+				FROM model_route_accounts binding
+				LEFT JOIN active_accounts active ON active.id = binding.account_id
+				GROUP BY binding.model_route_id
+			),
+			capability_stats AS (
+				SELECT active.provider,
+					capability.upstream_model,
+					COUNT(*) AS supported_accounts,
+					COUNT(*) FILTER (WHERE active.is_build_super) AS supported_super_accounts
+				FROM active_accounts active
+				JOIN account_model_capabilities capability ON capability.account_id = active.id
+				GROUP BY active.provider, capability.upstream_model
+			)
+			SELECT route.id AS route_id,
+				CASE
+					WHEN binding.total_accounts > 0 THEN binding.supported_accounts
+					WHEN `+modelStaticCatalogSupportAvailabilityExpression+` THEN COALESCE(provider.total_accounts, 0)
+					WHEN route.provider = 'grok_build' AND COALESCE(capability.supported_super_accounts, 0) > 0
+						THEN COALESCE(capability.supported_accounts, 0) + COALESCE(provider.build_super_accounts, 0) - COALESCE(capability.supported_super_accounts, 0)
+					ELSE COALESCE(capability.supported_accounts, 0)
+				END AS supported_accounts,
+				CASE WHEN binding.total_accounts > 0 THEN binding.synced_accounts ELSE COALESCE(provider.synced_accounts, 0) END AS synced_accounts,
+				CASE WHEN binding.total_accounts > 0 THEN binding.total_accounts ELSE COALESCE(provider.total_accounts, 0) END AS total_accounts,
+				CAST(EXTRACT(EPOCH FROM last_sync.last_success_at) AS BIGINT) AS last_synced_unix
+			FROM model_routes route
+			LEFT JOIN provider_stats provider ON provider.provider = route.provider
+			LEFT JOIN provider_last_sync last_sync ON last_sync.provider = route.provider
+			LEFT JOIN binding_stats binding ON binding.model_route_id = route.id
+			LEFT JOIN capability_stats capability ON capability.provider = route.provider AND capability.upstream_model = route.upstream_model
+			WHERE route.id IN ?
+		`, account.AuthStatusActive, ids).Scan(&rows).Error
+		if err != nil {
+			return err
+		}
+	} else {
+		err := r.db.db.WithContext(ctx).Raw(fmt.Sprintf(`
 		SELECT route.id AS route_id,
 			CASE WHEN COUNT(DISTINCT binding.account_id) > 0
 				THEN COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND binding.account_id IS NOT NULL THEN account.id END)
-				ELSE COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND (`+modelConsoleStaticSupportAvailabilityExpression+` OR capability.account_id IS NOT NULL OR `+modelSharedPaidBuildSupportAvailabilityExpression+`) THEN account.id END)
+				ELSE COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND (`+modelStaticCatalogSupportAvailabilityExpression+` OR capability.account_id IS NOT NULL OR `+modelSharedPaidBuildSupportAvailabilityExpression+`) THEN account.id END)
 			END AS supported_accounts,
 			CASE WHEN COUNT(DISTINCT binding.account_id) > 0
 				THEN COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? AND binding.account_id IS NOT NULL AND sync.last_success_at IS NOT NULL THEN account.id END)
@@ -1155,7 +1214,7 @@ func (r *ModelRepository) annotateAvailability(ctx context.Context, values []mod
 				THEN COUNT(DISTINCT binding.account_id)
 				ELSE COUNT(DISTINCT CASE WHEN account.enabled = TRUE AND account.auth_status = ? THEN account.id END)
 			END AS total_accounts,
-			%s AS last_synced_unix
+			MAX(unixepoch(sync.last_success_at)) AS last_synced_unix
 		FROM model_routes route
 		LEFT JOIN provider_accounts account ON account.provider = route.provider
 		LEFT JOIN model_route_accounts binding ON binding.model_route_id = route.id AND binding.account_id = account.id
@@ -1163,9 +1222,10 @@ func (r *ModelRepository) annotateAvailability(ctx context.Context, values []mod
 		LEFT JOIN account_model_capabilities capability ON capability.account_id = account.id AND capability.upstream_model = route.upstream_model
 		WHERE route.id IN ?
 		GROUP BY route.id
-	`, lastSyncedExpression), account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, ids).Scan(&rows).Error
-	if err != nil {
-		return err
+	`), account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, account.AuthStatusActive, ids).Scan(&rows).Error
+		if err != nil {
+			return err
+		}
 	}
 	var bindings []modelRouteAccountModel
 	if err := r.db.db.WithContext(ctx).Where("model_route_id IN ?", ids).Order("model_route_id ASC, account_id ASC").Find(&bindings).Error; err != nil {

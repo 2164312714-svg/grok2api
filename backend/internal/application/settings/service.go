@@ -99,6 +99,8 @@ type RoutingConfig struct {
 	CooldownMax                         string
 	CapacityWait                        string
 	MaxAttempts                         int
+	SelectionStrategy                   string
+	SelectionStrategyProvided           bool
 	PreferFreeBuild                     bool
 	MarkBuildChatDeniedAsReauth         bool
 	MarkBuildChatDeniedAsReauthProvided bool
@@ -378,6 +380,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	segmentedMinCandidates := base.Routing.SegmentedMinCandidates
 	segmentedWindowSize := base.Routing.SegmentedWindowSize
 	accountIsolatedConnections := base.Routing.AccountIsolatedConnections
+	selectionStrategy := base.Routing.SelectionStrategy
+	if value.Routing.SelectionStrategy != nil {
+		selectionStrategy = *value.Routing.SelectionStrategy
+	}
 	if value.Routing.AccountIsolatedConnections != nil {
 		accountIsolatedConnections = *value.Routing.AccountIsolatedConnections
 	}
@@ -389,6 +395,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
+		SelectionStrategy:           selectionStrategy,
 		MarkBuildChatDeniedAsReauth: value.Routing.MarkBuildChatDeniedAsReauth,
 		PreferFreeBuild:             value.Routing.PreferFreeBuild,
 		AccountIsolatedConnections:  accountIsolatedConnections,
@@ -431,6 +438,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 func toDomainConfig(value config.Config) settingsdomain.Config {
 	randomDelay := value.Batch.RandomDelay.Value()
 	accountIsolatedConnections := value.Routing.AccountIsolatedConnections
+	selectionStrategy := value.Routing.SelectionStrategy
 	return settingsdomain.Config{
 		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
@@ -473,6 +481,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
 			MarkBuildChatDeniedAsReauth: value.Routing.MarkBuildChatDeniedAsReauth,
 			PreferFreeBuild:             value.Routing.PreferFreeBuild,
+			SelectionStrategy:           &selectionStrategy,
 			AccountIsolatedConnections:  &accountIsolatedConnections,
 			SegmentedSelector: &settingsdomain.SegmentedSelectorConfig{
 				ActiveEnabled: value.Routing.SegmentedSelectorEnabled,
@@ -555,6 +564,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Media.CleanupThresholdPercent = input.Media.CleanupThresholdPercent
 	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
+	if input.Routing.SelectionStrategyProvided {
+		next.Routing.SelectionStrategy = input.Routing.SelectionStrategy
+	}
 	next.Routing.PreferFreeBuild = input.Routing.PreferFreeBuild
 	if input.Routing.AccountIsolatedConnectionsProvided {
 		next.Routing.AccountIsolatedConnections = input.Routing.AccountIsolatedConnections
@@ -698,6 +710,8 @@ func toEditable(cfg config.Config) EditableConfig {
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
 			MarkBuildChatDeniedAsReauth:         cfg.Routing.MarkBuildChatDeniedAsReauth,
 			MarkBuildChatDeniedAsReauthProvided: true,
+			SelectionStrategy:                   cfg.Routing.SelectionStrategy,
+			SelectionStrategyProvided:           true,
 			PreferFreeBuild:                     cfg.Routing.PreferFreeBuild,
 			AccountIsolatedConnections:          cfg.Routing.AccountIsolatedConnections,
 			AccountIsolatedConnectionsProvided:  true,

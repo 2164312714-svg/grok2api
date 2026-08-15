@@ -25,14 +25,15 @@ type candidateScore struct {
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
 type candidatePlan struct {
-	values []account.RoutingCandidate
-	scores []candidateScore
+	values   []account.RoutingCandidate
+	scores   []candidateScore
+	strategy selectionStrategy
 }
 
 func (p *candidatePlan) Len() int { return len(p.scores) }
 
 func (p *candidatePlan) Less(left, right int) bool {
-	return candidateScoreBetter(p.values, p.scores[left], p.scores[right])
+	return candidateScoreBetterForStrategy(p.values, p.scores[left], p.scores[right], p.strategy)
 }
 
 func (p *candidatePlan) Swap(left, right int) {
@@ -59,6 +60,10 @@ func (p *candidatePlan) Next() (account.RoutingCandidate, bool) {
 }
 
 func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightScore candidateScore) bool {
+	return candidateScoreBetterForStrategy(values, leftScore, rightScore, selectionStrategyBalanced)
+}
+
+func candidateScoreBetterForStrategy(values []account.RoutingCandidate, leftScore, rightScore candidateScore, strategy selectionStrategy) bool {
 	leftCandidate, rightCandidate := values[leftScore.index], values[rightScore.index]
 	left, right := leftCandidate.Credential, rightCandidate.Credential
 	if leftCandidate.SupportsModel != rightCandidate.SupportsModel {
@@ -87,6 +92,9 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	}
 	if leftScore.billingFresh != rightScore.billingFresh {
 		return leftScore.billingFresh
+	}
+	if strategy == selectionStrategySequential {
+		return left.ID < right.ID
 	}
 	if leftScore.inFlight != rightScore.inFlight {
 		return leftScore.inFlight < rightScore.inFlight
@@ -200,7 +208,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		scores = append(scores, score)
 	}
 	s.selectionMu.RUnlock()
-	plan := &candidatePlan{values: values, scores: scores}
+	plan := &candidatePlan{values: values, scores: scores, strategy: s.currentSelectionStrategy()}
 	heap.Init(plan)
 	return plan, nil
 }

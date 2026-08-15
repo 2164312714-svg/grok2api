@@ -13,12 +13,59 @@ import (
 	"testing"
 	"time"
 
+	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
+
+func TestPreferConsoleForDefaultVideo(t *testing.T) {
+	routes := []modeldomain.Route{
+		{ID: 1, PublicID: "Web/grok-imagine-video", Provider: account.ProviderWeb, Capability: modeldomain.CapabilityVideo},
+		{ID: 2, PublicID: "Console/grok-imagine-video", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityVideo},
+	}
+	ordered := preferConsoleForDefaultVideo("grok-imagine-video", routes)
+	if ordered[0].Provider != account.ProviderConsole || ordered[1].Provider != account.ProviderWeb {
+		t.Fatalf("default video order = %#v", ordered)
+	}
+	if routes[0].Provider != account.ProviderWeb {
+		t.Fatal("default video preference mutated repository candidates")
+	}
+	for _, explicit := range []string{"Web/grok-imagine-video", "Console/grok-imagine-video", "grok-imagine-video-1.5"} {
+		unchanged := preferConsoleForDefaultVideo(explicit, routes)
+		if unchanged[0].Provider != account.ProviderWeb {
+			t.Fatalf("route order changed for %q: %#v", explicit, unchanged)
+		}
+	}
+}
+
+func TestDefaultVideoPreferenceRespectsClientKeyScope(t *testing.T) {
+	routes := preferConsoleForDefaultVideo("grok-imagine-video", []modeldomain.Route{
+		{ID: 1, PublicID: "Web/grok-imagine-video", Provider: account.ProviderWeb, Capability: modeldomain.CapabilityVideo},
+		{ID: 2, PublicID: "Console/grok-imagine-video", Provider: account.ProviderConsole, Capability: modeldomain.CapabilityVideo},
+	})
+	service := &Service{clientKeys: clientkeyapp.NewService(nil, nil, nil, 60, 4, nil)}
+	supportsVideo := func(providerValue account.Provider) bool {
+		return providerValue == account.ProviderWeb || providerValue == account.ProviderConsole
+	}
+
+	selected, err := service.selectMediaRoute(routes, clientkey.Key{}, modeldomain.CapabilityVideo, supportsVideo)
+	if err != nil || selected.Provider != account.ProviderConsole {
+		t.Fatalf("unrestricted selection = %#v, %v", selected, err)
+	}
+	selected, err = service.selectMediaRoute(routes, clientkey.Key{ProviderScope: clientkey.ProviderScopeWeb}, modeldomain.CapabilityVideo, supportsVideo)
+	if err != nil || selected.Provider != account.ProviderWeb {
+		t.Fatalf("Web-scoped selection = %#v, %v", selected, err)
+	}
+	selected, err = service.selectMediaRoute(routes, clientkey.Key{AllowedModels: []uint64{1}}, modeldomain.CapabilityVideo, supportsVideo)
+	if err != nil || selected.Provider != account.ProviderWeb {
+		t.Fatalf("model-scoped fallback = %#v, %v", selected, err)
+	}
+}
 
 func TestRecoverVideoJobsRetriesUsageWithoutRegeneratingVideo(t *testing.T) {
 	completedAt := time.Now().UTC()

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/repository"
+	"gorm.io/gorm"
 )
 
 func TestDashboardRepositorySnapshot(t *testing.T) {
@@ -137,6 +138,79 @@ func TestDashboardRepositoryCounts2xxWithErrorAsFailure(t *testing.T) {
 	}
 	if snapshot.Usage.Requests != 2 || snapshot.Usage.SuccessfulRequests != 1 || snapshot.Usage.FailedRequests != 1 {
 		t.Fatalf("usage = %#v", snapshot.Usage)
+	}
+}
+
+func TestDashboardPostgresBucketExpression(t *testing.T) {
+	start := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+	boundaries := testDashboardBoundaries(start, time.Hour, 2)
+	expression, args := dashboardPostgresBucketExpression(boundaries)
+	if expression != "width_bucket(created_at, ARRAY[?::timestamptz, ?::timestamptz, ?::timestamptz]) - 1" {
+		t.Fatalf("expression = %q", expression)
+	}
+	if len(args) != len(boundaries) {
+		t.Fatalf("args count = %d, want %d", len(args), len(boundaries))
+	}
+	for index, value := range args {
+		boundary, ok := value.(time.Time)
+		if !ok || !boundary.Equal(boundaries[index]) {
+			t.Fatalf("arg %d = %#v, want %s", index, value, boundaries[index])
+		}
+	}
+}
+
+func TestDashboardRepositorySQLiteSnapshotAllowsConcurrentWrite(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "dashboard-concurrency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	repository := NewDashboardRepository(database)
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	snapshotDone := make(chan error, 1)
+	go func() {
+		snapshotDone <- repository.withSnapshot(ctx, func(tx *gorm.DB) error {
+			var count int64
+			if err := tx.Model(&requestAuditModel{}).Count(&count).Error; err != nil {
+				return err
+			}
+			close(readStarted)
+			select {
+			case <-releaseRead:
+				return nil
+			case <-time.After(5 * time.Second):
+				return fmt.Errorf("timed out waiting to release dashboard snapshot")
+			}
+		})
+	}()
+	<-readStarted
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- database.db.WithContext(ctx).Create(&requestAuditModel{
+			RequestID: "concurrent-write", ClientKeyID: 1, ModelRouteID: 1,
+			Provider: "grok_build", Operation: "responses", UsageSource: "upstream",
+			StatusCode: 200, CreatedAt: time.Now().UTC(),
+		}).Error
+	}()
+	select {
+	case err := <-writeDone:
+		close(releaseRead)
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		t.Fatal("dashboard read snapshot blocked a concurrent SQLite write")
+	}
+	if err := <-snapshotDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

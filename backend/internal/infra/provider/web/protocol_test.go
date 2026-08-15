@@ -131,6 +131,99 @@ func TestNormalizeOpenAIInputSeparatesTextAndImages(t *testing.T) {
 	}
 }
 
+func TestNormalizeLatestImageInputIgnoresHistoricalAssistantImage(t *testing.T) {
+	historical, _ := json.Marshal([]any{
+		map[string]any{"type": "text", "text": "first result"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/first.png"}},
+	})
+	latest, _ := json.Marshal("生成另一张蓝色的图片")
+	value, err := normalizeLatestImageInput(openAIRequest{Messages: []chatMessage{
+		{Role: "user", Content: json.RawMessage(`"生成第一张图片"`)},
+		{Role: "assistant", Content: historical},
+		{Role: "user", Content: latest},
+	}}, conversation.OperationChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Prompt != "生成另一张蓝色的图片" || len(value.Attachments) != 0 {
+		t.Fatalf("normalized latest image input = %#v", value)
+	}
+}
+
+func TestNormalizeLatestImageInputDropsAllImageAttachments(t *testing.T) {
+	const imageURL = "https://example.com/first.png"
+	historical, _ := json.Marshal([]any{
+		map[string]any{"type": "output_text", "text": "![image](" + imageURL + ")"},
+	})
+	latest, _ := json.Marshal([]any{
+		map[string]any{"type": "text", "text": "生成另一张红色的图片"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL}},
+	})
+	value, err := normalizeLatestImageInput(openAIRequest{Messages: []chatMessage{
+		{Role: "assistant", Content: historical},
+		{Role: "user", Content: latest},
+	}}, conversation.OperationChat)
+	if err != nil || value.Prompt != "生成另一张红色的图片" || len(value.Attachments) != 0 {
+		t.Fatalf("normalized replayed image input = %#v, err = %v", value, err)
+	}
+
+	newImage, _ := json.Marshal([]any{
+		map[string]any{"type": "text", "text": "修改这张新图片"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/new.png"}},
+	})
+	value, err = normalizeLatestImageInput(openAIRequest{Messages: []chatMessage{
+		{Role: "assistant", Content: historical},
+		{Role: "user", Content: newImage},
+	}}, conversation.OperationChat)
+	if err != nil || value.Prompt != "修改这张新图片" || len(value.Attachments) != 0 {
+		t.Fatalf("current image attachment was not filtered = %#v, err = %v", value, err)
+	}
+}
+
+func TestNormalizeLatestResponsesImageInputIgnoresHistory(t *testing.T) {
+	input, _ := json.Marshal([]any{
+		map[string]any{"type": "message", "role": "assistant", "content": []any{
+			map[string]any{"type": "output_text", "text": "![image](https://example.com/first.png)"},
+			map[string]any{"type": "input_image", "image_url": "https://example.com/first.png"},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "input_text", "text": "generate a different image"},
+		}},
+	})
+	value, err := normalizeLatestImageInput(openAIRequest{Input: input}, conversation.OperationResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Prompt != "generate a different image" || len(value.Attachments) != 0 {
+		t.Fatalf("normalized latest responses input = %#v", value)
+	}
+}
+
+func TestNormalizeLatestImageInputRequiresTextAfterFilteringImages(t *testing.T) {
+	content, _ := json.Marshal([]any{
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/input.png"}},
+	})
+	_, err := normalizeLatestImageInput(openAIRequest{Messages: []chatMessage{{Role: "user", Content: content}}}, conversation.OperationChat)
+	if err == nil || !strings.Contains(err.Error(), "提示词不能为空") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestQualityImageResponsesUsesImageCompatibilityValidation(t *testing.T) {
+	response, err := (&Adapter{}).ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Method: http.MethodPost, Model: "grok-imagine-image-quality", Operation: conversation.OperationResponses,
+		Body: []byte(`{"model":"grok-imagine-image-quality-lite","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"draw"}]}],"image_config":{"n":0}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "image_config.n") || strings.Contains(string(body), "模型不支持文本对话") {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func TestNormalizeResponsesInputImage(t *testing.T) {
 	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 	input, _ := json.Marshal([]any{map[string]any{
@@ -573,6 +666,56 @@ func TestLiteChatRejectsInvalidImageConfigBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestLiteChatStreamFailsBeforeReturningSuccessResponse(t *testing.T) {
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		if request.URL.Path != "/ws/mgw/" {
+			fhttp.NotFound(writer, request)
+			return
+		}
+		connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer connection.Close()
+		var initial map[string]any
+		if err := connection.ReadJSON(&initial); err != nil {
+			t.Errorf("read session.create: %v", err)
+			return
+		}
+		initialID := initial["event"].(map[string]any)["event_id"].(string)
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "session.created", "client_event_id": initialID}})
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "conversation.attached", "conversation": map[string]any{"id": "conv_1"}}})
+		for range 2 {
+			var event map[string]any
+			if err := connection.ReadJSON(&event); err != nil {
+				t.Errorf("read turn event: %v", err)
+				return
+			}
+		}
+		_ = connection.WriteJSON(map[string]any{"session_id": "conv_1", "event": map[string]any{"type": "response.done", "response": map[string]any{"id": "parent_1", "status": "completed"}}})
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual"}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, imageAssetStoreStub{})
+	response, err := adapter.ForwardResponse(context.Background(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca", EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/v1/chat/completions", Model: "grok-imagine-image", Operation: conversation.OperationChat,
+		Body: []byte(`{"model":"grok-imagine-image-lite","stream":true,"messages":[{"role":"user","content":"draw a cat"}]}`), Streaming: true,
+	})
+	if err == nil || response != nil || !strings.Contains(err.Error(), "未解析到最终图片") {
+		t.Fatalf("response=%#v error=%v", response, err)
+	}
+}
+
 func TestParseLiteImageCardAttachment(t *testing.T) {
 	parsed := &parsedChat{}
 	frame := map[string]any{"result": map[string]any{"response": map[string]any{
@@ -586,10 +729,20 @@ func TestParseLiteImageCardAttachment(t *testing.T) {
 }
 
 func TestParseLiteNestedUsageLimit(t *testing.T) {
-	parsed := &parsedChat{}
-	frame := []byte(`{"result":{"response":{"error":{"message":"You've reached your usage limit. Please try again later."},"cardAttachment":{"jsonData":"{\"image_chunk\":{\"progress\":100,\"systemErrCode\":\"rate_limit\"}}"}}}}`)
-	if _, _, err := parseUpstreamFrame(frame, parsed); !errors.Is(err, errWebUsageLimit) {
-		t.Fatalf("error = %v", err)
+	for _, message := range []string{
+		"You've reached your usage limit. Please try again later.",
+		"You've hit your image rate limit. Please try again later.",
+	} {
+		t.Run(message, func(t *testing.T) {
+			parsed := &parsedChat{}
+			frame, _ := json.Marshal(map[string]any{"result": map[string]any{"response": map[string]any{
+				"error":          map[string]any{"message": message},
+				"cardAttachment": map[string]any{"jsonData": `{"image_chunk":{"progress":100,"systemErrCode":"rate_limit"}}`},
+			}}})
+			if _, _, err := parseUpstreamFrame(frame, parsed); !errors.Is(err, errWebUsageLimit) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
@@ -684,25 +837,27 @@ func TestImageEditRejectsUnconfirmedCountAndResolution(t *testing.T) {
 	}
 }
 
-func TestBuildImageEditPayloadMatchesCapturedAspectRatioShape(t *testing.T) {
-	payload := buildImageEditPayload("改成兔子", []string{"https://assets.grok.com/users/test/reference/content"}, "post_1", "1:1")
+func TestBuildImageEditPayloadMatchesCurrentWebProtocol(t *testing.T) {
+	assets := []string{"file-metadata-1", "file-metadata-2"}
+	payload := buildImageEditPayload("改成兔子", assets, "1:1")
 	metadata, _ := payload["responseMetadata"].(map[string]any)
 	override, _ := metadata["modelConfigOverride"].(map[string]any)
 	modelMap, _ := override["modelMap"].(map[string]any)
-	config, _ := modelMap["imageEditModelConfig"].(map[string]any)
-	if payload["modelName"] != "imagine-image-edit" || payload["imageGenerationCount"] != 2 || modelMap["imageEditModel"] != "imagine" {
+	mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
+	imageToImage, _ := mediaGenInput["imageToImage"].(map[string]any)
+	if payload["modelName"] != "imagine-image-edit" || payload["kind"] != "CONVERSATION_KIND_IMAGINE" || modelMap["imageEditModel"] != "imagine" {
 		t.Fatalf("payload = %#v", payload)
 	}
-	if config["aspectRatio"] != "1:1" || config["parentPostId"] != "post_1" || !slices.Equal(config["imageReferences"].([]string), []string{"https://assets.grok.com/users/test/reference/content"}) {
-		t.Fatalf("image edit config = %#v", config)
+	if imageToImage["prompt"] != "改成兔子" || !slices.Equal(imageToImage["inputAssets"].([]string), assets) {
+		t.Fatalf("image-to-image input = %#v", imageToImage)
 	}
-	withoutRatio := buildImageEditPayload("edit", []string{"reference"}, "post_2", "")
-	metadata = withoutRatio["responseMetadata"].(map[string]any)
-	override = metadata["modelConfigOverride"].(map[string]any)
-	modelMap = override["modelMap"].(map[string]any)
-	config = modelMap["imageEditModelConfig"].(map[string]any)
-	if _, exists := config["aspectRatio"]; exists {
-		t.Fatalf("empty aspect ratio leaked into payload: %#v", config)
+	for _, legacy := range []string{"temporary", "imageGenerationCount", "enableImageGeneration", "config"} {
+		if _, exists := payload[legacy]; exists {
+			t.Fatalf("legacy field %q leaked into payload: %#v", legacy, payload)
+		}
+	}
+	if _, exists := modelMap["imageEditModelConfig"]; exists {
+		t.Fatalf("legacy imageEditModelConfig leaked into payload: %#v", modelMap)
 	}
 }
 
@@ -999,6 +1154,7 @@ func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing
 	logLine := output.String()
 	for _, expected := range []string{
 		"msg=web_media_upstream_rejected", "stage=video_reference_upload", "status=403",
+		"error_summary=\"Grok Web 媒体上游返回 403: 响应正文过长\"",
 		"body_truncated=true", "body_prefix_sha256=", "body_kind=html", "cloudflare_challenge=true",
 		"content_type=\"text/html; charset=UTF-8\"",
 		"server=cloudflare", "cf_ray=test-ray-SIN",
@@ -1014,7 +1170,7 @@ func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing
 	}
 }
 
-func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
+func TestModelsUseLowestSufficientTierFirst(t *testing.T) {
 	adapter := &Adapter{}
 	tests := []struct {
 		model string
@@ -1024,6 +1180,7 @@ func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
 		{model: "grok-chat-auto", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
 		{model: "grok-chat-expert", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
 		{model: "grok-chat-heavy", want: []account.WebTier{account.WebTierHeavy}},
+		{model: "imagine-image-edit", want: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}},
 	}
 	for _, test := range tests {
 		got := adapter.TierOrder(test.model)

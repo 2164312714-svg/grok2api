@@ -151,6 +151,9 @@ bootstrapAdmin:
 	if cfg.Routing.PreferFreeBuild {
 		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
 	}
+	if cfg.Routing.SelectionStrategy != "balanced" {
+		t.Fatalf("selection strategy default = %q", cfg.Routing.SelectionStrategy)
+	}
 	if cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
 		t.Fatalf("segmented selector defaults = %#v", cfg.Routing)
 	}
@@ -385,6 +388,14 @@ func TestValidateRejectsInvalidSegmentedSelectorConfig(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("case %d accepted invalid segmented selector config", index)
 		}
+	}
+}
+
+func TestValidateRejectsInvalidSelectionStrategy(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Routing.SelectionStrategy = "random"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid selection strategy was accepted")
 	}
 }
 

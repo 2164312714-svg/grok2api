@@ -20,6 +20,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
@@ -62,6 +63,8 @@ type openAIRequest struct {
 	ImageConfig       *struct {
 		Count          *int   `json:"n"`
 		ResponseFormat string `json:"response_format"`
+		AspectRatio    string `json:"aspect_ratio"`
+		Resolution     string `json:"resolution"`
 	} `json:"image_config"`
 }
 
@@ -209,7 +212,14 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if len(input.Include) > 0 {
 		conversationOptions.Include = append([]string{}, input.Include...)
 	}
-	normalized, err := normalizeOpenAIInput(input, request.Operation)
+	spec, modelKnown := Resolve(request.Model)
+	var normalized normalizedChatInput
+	var err error
+	if modelKnown && spec.Capability == modeldomain.CapabilityImage {
+		normalized, err = normalizeLatestImageInput(input, request.Operation)
+	} else {
+		normalized, err = normalizeOpenAIInput(input, request.Operation)
+	}
 	if err != nil {
 		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"}}), nil
 	}
@@ -221,14 +231,16 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if input.ParallelToolCalls != nil {
 		parallelTools = *input.ParallelToolCalls
 	}
-	spec, ok := Resolve(request.Model)
-	if ok && spec.ProtocolModel == "imagine-lite" && request.Operation == "chat" {
+	if modelKnown && spec.Capability == modeldomain.CapabilityImage {
 		if len(tools.ResponseTools) > 0 {
-			return invalidImageRequest("grok-imagine-image-lite 不支持 tools")
+			return invalidImageRequest("图片生成模型不支持 tools")
 		}
-		return a.forwardLiteChatCompletion(ctx, request, input, normalized, spec)
+		return a.forwardImageChatCompletion(ctx, request, input, normalized, spec)
 	}
-	if !ok || spec.Capability != "chat" {
+	if modelKnown && spec.Capability == modeldomain.CapabilityImageEdit {
+		return invalidImageRequest("图片编辑模型请使用 /v1/images/edits，并在当前请求中显式提供输入图片")
+	}
+	if !modelKnown || spec.Capability != modeldomain.CapabilityChat {
 		return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "模型不支持文本对话", "type": "invalid_request_error"}}), nil
 	}
 
@@ -736,6 +748,85 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 	return normalizedChatInput{Prompt: value, Attachments: attachments}, nil
 }
 
+// Image generation is stateless: only text from the latest user turn is a
+// prompt. Explicit image editing is routed before this adapter, so image
+// attachments that clients replay into a generation request are transport
+// context and must not turn the request into an edit.
+func normalizeLatestImageInput(input openAIRequest, operation string) (normalizedChatInput, error) {
+	if operation == conversation.OperationChat {
+		for index := len(input.Messages) - 1; index >= 0; index-- {
+			message := input.Messages[index]
+			if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+				continue
+			}
+			value, err := normalizeImageMessage(message.Content)
+			return textOnlyImageGenerationInput(value, err)
+		}
+		return normalizedChatInput{}, errors.New("messages 中缺少用户消息")
+	}
+
+	trimmed := bytes.TrimSpace(input.Input)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return normalizedChatInput{}, errors.New("input 不能为空")
+	}
+	if trimmed[0] == '"' {
+		var prompt string
+		if json.Unmarshal(trimmed, &prompt) != nil {
+			return normalizedChatInput{}, errors.New("input 格式无效")
+		}
+		prompt = strings.TrimSpace(prompt)
+		if prompt == "" {
+			return normalizedChatInput{}, errors.New("图片生成提示词不能为空")
+		}
+		return normalizedChatInput{Prompt: prompt}, nil
+	}
+
+	var messages []chatMessage
+	if json.Unmarshal(trimmed, &messages) != nil {
+		return normalizedChatInput{}, errors.New("input 必须是字符串或消息数组")
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		message := messages[index]
+		typeName := strings.ToLower(strings.TrimSpace(message.Type))
+		if (typeName == "" || typeName == "message") && strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			value, err := normalizeImageMessage(message.Content)
+			return textOnlyImageGenerationInput(value, err)
+		}
+	}
+	return normalizedChatInput{}, errors.New("input 中缺少用户消息")
+}
+
+func textOnlyImageGenerationInput(value normalizedChatInput, err error) (normalizedChatInput, error) {
+	if err != nil {
+		return normalizedChatInput{}, err
+	}
+	attachments := value.Attachments[:0]
+	for _, attachment := range value.Attachments {
+		if attachment.Image {
+			continue
+		}
+		attachments = append(attachments, attachment)
+	}
+	value.Attachments = attachments
+	value.Prompt = strings.TrimSpace(value.Prompt)
+	if value.Prompt == "" {
+		return normalizedChatInput{}, errors.New("图片生成提示词不能为空")
+	}
+	return value, nil
+}
+
+func normalizeImageMessage(content json.RawMessage) (normalizedChatInput, error) {
+	prompt, attachments, err := contentTextAndAttachments(content)
+	if err != nil {
+		return normalizedChatInput{}, err
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" && len(attachments) == 0 {
+		return normalizedChatInput{}, errors.New("图片生成提示词不能为空")
+	}
+	return normalizedChatInput{Prompt: prompt, Attachments: attachments}, nil
+}
+
 func rawTextValue(raw json.RawMessage) (string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1065,7 +1156,8 @@ func webResponseError(value map[string]any) error {
 		return fmt.Errorf("%w: %s", errWebAntiBot, message)
 	}
 	normalized := strings.ToLower(message)
-	if strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "usage quota") {
+	if strings.Contains(normalized, "usage limit") || strings.Contains(normalized, "usage quota") ||
+		strings.Contains(normalized, "image rate limit") || strings.Contains(normalized, "image quota") {
 		return fmt.Errorf("%w: %s", errWebUsageLimit, message)
 	}
 	return errors.New(message)
